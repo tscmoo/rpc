@@ -1,5 +1,7 @@
 #include "rpc.h"
 
+#include "network.h"
+
 #include <tensorpipe/tensorpipe.h>
 #include <tensorpipe/transport/listener.h>
 #include <tensorpipe/transport/connection.h>
@@ -316,6 +318,82 @@ Connection::Connection(std::shared_ptr<Pipe> inpipe, std::shared_ptr<Pipe> outpi
 
 }
 
+namespace network {
+
+struct Connection;
+struct Listener;
+
+struct Context {
+  Connection connect(std::string_view url);
+  Listener listen(std::string_view url);
+
+  ::network::Network nw;
+
+  std::thread thread, thread2, thread3;
+  Context() {
+    thread = std::thread([this]() {
+      while (true) {
+        nw.run_one();
+      }
+    });
+//    thread2 = std::thread([this]() {
+//      while (true) {
+//        nw.run_one();
+//      }
+//    });
+//    thread3 = std::thread([this]() {
+//      while (true) {
+//        nw.run_one();
+//      }
+//    });
+  }
+};
+
+struct Listener {
+  ::network::Server server;
+
+  void accept(Function<void(Error*, Connection&&)>&& callback);
+};
+
+
+struct Connection {
+  ::network::Peer peer;
+
+  void close() {
+    peer.post_close();
+  }
+  void read(Function<bool(Error*, const void*, size_t)>&& callback) {
+    peer.setOnMessage([callback = std::move(callback)](const void* ptr, size_t len) {
+      callback(nullptr, ptr, len);
+    });
+  }
+  void write(const void* ptr, size_t len, Function<void(Error*)>&& callback) {
+    peer.sendMessage(ptr, len);
+    callback(nullptr);
+  }
+};
+
+void Listener::accept(Function<void (Error*, Connection&&)>&& callback) {
+  server.setOnPeer([callback = std::move(callback)](auto&& peer) {
+    Connection conn;
+    conn.peer = std::move(peer);
+    callback(nullptr, std::move(conn));
+  });
+}
+
+Connection Context::connect(std::string_view url) {
+  Connection c;
+  c.peer = nw.connect(url);
+  return c;
+}
+Listener Context::listen(std::string_view url) {
+  Listener l;
+  l.server = nw.listen(url);
+  return l;
+}
+
+}
+
 struct API_InProcess {
   using Context = inproc::Context;
   using Connection = std::unique_ptr<inproc::Connection>;
@@ -323,6 +401,7 @@ struct API_InProcess {
 
   static constexpr bool supportsBuffer = true;
   static constexpr bool persistentRead = true;
+  static constexpr bool persistentAccept = true;
 
   static auto& cast(Connection& x) {
     return *x;
@@ -339,6 +418,7 @@ struct API_TPSHM {
 
   static constexpr bool supportsBuffer = false;
   static constexpr bool persistentRead = false;
+  static constexpr bool persistentAccept = false;
 
   static auto& cast(Connection& x) {
     return (tensorpipe::transport::shm::Connection&)*x;
@@ -358,6 +438,7 @@ struct API_TPUV {
 
   static constexpr bool supportsBuffer = false;
   static constexpr bool persistentRead = false;
+  static constexpr bool persistentAccept = false;
 
   static auto& cast(Connection& x) {
     return (tensorpipe::transport::uv::Connection&)*x;
@@ -367,6 +448,20 @@ struct API_TPUV {
   }
   static std::string errstr(const tensorpipe::Error& err) {
     return err.what();
+  }
+};
+
+struct API_Network {
+  using Context = network::Context;
+  using Connection = network::Connection;
+  using Listener = network::Listener;
+
+  static constexpr bool supportsBuffer = false;
+  static constexpr bool persistentRead = true;
+  static constexpr bool persistentAccept = true;
+
+  template<typename T> static T& cast(T& v) {
+    return v;
   }
 };
 
@@ -514,7 +609,9 @@ struct RpcConnectionImpl : RpcConnection::Impl {
   }
 
   void read(Me&& me) {
+    //printf("read %p\n", this);
     API::cast(connection).read([me = std::move(me)](auto&& error, auto&&... args) mutable {
+      //printf("%p got data\n");
       if (me->dead.load(std::memory_order_relaxed)) {
         if constexpr (API::persistentRead) {
           return false;
@@ -594,7 +691,7 @@ struct RpcListenerImpl : RpcListener::Impl {
   typename API::Listener listener;
 
   virtual void accept(Function<void(RpcConnection*, Error*)>&& callback) override {
-    API::cast(listener).accept([this, callback = std::move(callback)](auto&& error, auto&& conn) {
+    API::cast(listener).accept([this, callback = std::move(callback)](auto&& error, auto&& conn) mutable {
       if (error) {
         if constexpr (std::is_same_v<std::decay_t<decltype(error)>, Error*>) {
           callback(nullptr, error);
@@ -608,6 +705,9 @@ struct RpcListenerImpl : RpcListener::Impl {
         ci->start();
         c.impl_ = std::move(ci);
         callback(&c, nullptr);
+        if (!API::persistentAccept) {
+          accept(std::move(callback));
+        }
       }
     });
   }
@@ -691,6 +791,7 @@ struct RpcImpl : Rpc::Impl {
   }
 
   virtual void onRequest(RpcConnection::Impl& connx, uint32_t rid, uint32_t fid, const std::byte* ptr, size_t len) override {
+    //printf("onRequest rid %#x fid %#x %p %d\n", rid, fid, ptr, len);
     auto& conn = (RpcConnectionImpl<API>&)connx;
     rid &= ~(uint32_t)1;
     if (fid == 0) {
@@ -739,8 +840,9 @@ void RpcListener::accept(Function<void(RpcConnection*, Error*)>&& callback) {
 }
 
 Rpc::Rpc() {
-  impl_ = std::make_unique<RpcImpl<APIWrapper<API_TPUV>>>();
-  //impl_ = std::make_unique<RpcImpl<APIWrapper<API_TPSHM>>>();
+  //impl_ = std::make_unique<RpcImpl<APIWrapper<API_Network>>>();
+  //impl_ = std::make_unique<RpcImpl<APIWrapper<API_TPUV>>>();
+  impl_ = std::make_unique<RpcImpl<APIWrapper<API_TPSHM>>>();
   //impl_ = std::make_unique<RpcImpl<APIWrapper<API_InProcess>>>();
 }
 Rpc::~Rpc() {}

@@ -19,8 +19,8 @@ add_executable(rpctest src/test.cc)
 target_include_directories(rpctest PUBLIC src/tensorpipe)
 target_link_libraries(rpctest tensorpipe)
 
-add_executable(rpctest2 src/test2.cc src/rpc.cc)
-target_include_directories(rpctest2 PUBLIC src/tensorpipe)
+add_executable(rpctest2 src/test2.cc src/rpc.cc src/network.cc)
+target_include_directories(rpctest2 PUBLIC src/tensorpipe src)
 target_link_libraries(rpctest2 tensorpipe)
 
 
