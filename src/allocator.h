@@ -15,7 +15,7 @@ struct Storage {
   Header* freelist = nullptr;
 
   Header* allocate(size_t n) {
-    //printf("allocate %p %s\n", this, typeid(*this).name());
+    //printf("allocate %p %s %d\n", this, typeid(*this).name(), n);
     static_assert(alignof(Header) >= alignof(Data));
 //    Header* h = (Header*)std::malloc(sizeof(Header) + sizeof(Data) * n);
 //    h->capacity = n;
@@ -23,15 +23,30 @@ struct Storage {
     Header* r = freelist;
     if (!r) {
       r = (Header*)std::malloc(sizeof(Header) + sizeof(Data) * n);
-      r->capacity = n;
-    } else if (r->capacity < n) {
-      std::free(r);
-      r = (Header*)std::malloc(sizeof(Header) + sizeof(Data) * n);
-      r->capacity = n;
+      new (r) Header();
+    } else {
+      freelist = r->next;
+      if (r->capacity < n) {
+        if (r->refcount != 0) {
+          std::abort();
+        }
+        r->~Header();
+        std::free(r);
+        r = (Header*)std::malloc(sizeof(Header) + sizeof(Data) * n);
+        new (r) Header();
+      }
+    }
+    //printf("allocate %p refcount %d\n", r, (int)r->refcount);
+    if (r->refcount != 0) {
+      std::abort();
     }
     return r;
   }
   void deallocate(Header* ptr) {
+    //printf("deallocate %p refcount %d\n", ptr, (int)ptr->refcount);
+    if (ptr->refcount != 0) {
+      std::abort();
+    }
 //    std::free(ptr);
 //    return;
     ptr->next = freelist;

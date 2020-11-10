@@ -9,7 +9,7 @@ namespace rpc {
 using SpinMutex = std::mutex;
 #elif __GNUC__ && __x86_64__
 
-class alignas(64) SpinMutex {
+class SpinMutex {
   int lock_;
 public:
   void lock() {

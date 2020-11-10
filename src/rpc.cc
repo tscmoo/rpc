@@ -79,8 +79,8 @@ struct Connection {
 
   std::thread thread;
 
-  alignas(64) std::atomic<tensorpipe::FunctionPointer> readCallback;
-  alignas(64) std::atomic<tensorpipe::FunctionPointer> writeCallback;
+  alignas(64) std::atomic<tensorpipe::FunctionPointer> readCallback = nullptr;
+  alignas(64) std::atomic<tensorpipe::FunctionPointer> writeCallback = nullptr;
 };
 
 std::unique_ptr<Connection> Context::connect(std::string_view url) {
@@ -573,10 +573,18 @@ struct RpcConnectionImpl : RpcConnection::Impl {
     std::memcpy(&fid, ptr, sizeof(uint32_t));
     ptr += sizeof(uint32_t);
     len -= sizeof(uint32_t);
-    //printf("onData rid %#x fid %#x\n", rid, fid);
+    //printf("onData rid %#x fid %#x len %d\n", rid, fid, len);
     if (rid & 1) {
       rpc.onRequest(*this, rid, fid, ptr, len);
     } else {
+      if (fid == Rpc::reqAck) {
+        //printf("got ack, cool\n");
+        return;
+      }
+      BufferHandle buffer;
+      serializeToBuffer(buffer, rid | 1, Rpc::reqAck);
+      //printf("ack response for rid %#x\n", rid);
+      send(std::move(buffer));
       Rpc::ResponseCallback response;
       {
         std::lock_guard l(reqMutex);
@@ -586,15 +594,15 @@ struct RpcConnectionImpl : RpcConnection::Impl {
         }
       }
       if (response) {
-        if (fid == 0) {
+        if (fid == Rpc::reqFunctionNotFound) {
           Error err("Remote function not found");
           std::move(response)(nullptr, 0, &err);
-        } else if (fid == 2) {
+        } else if (fid == Rpc::reqError) {
           std::string_view str;
           deserializeBuffer(ptr, len, str);
           Error err{"Remote exception during RPC call: " + std::string(str)};
           std::move(response)(nullptr, 0, &err);
-        } else {
+        } else if (fid == Rpc::reqSuccess) {
           std::move(response)(ptr, len, nullptr);
         }
       }
@@ -639,11 +647,16 @@ struct RpcConnectionImpl : RpcConnection::Impl {
     read(this);
   }
 
-  void send(BufferHandle&& buffer) {
+  template<typename Buffer>
+  void send(Buffer buffer) {
     auto* ptr = buffer->data();
     size_t size = buffer->size;
+    //printf("%p :: send %d bytes\n", this, size);
     if constexpr (API::supportsBuffer) {
-      API::cast(connection).write(std::move(buffer), [me = Me(this)](auto&& error) mutable {
+      BufferHandle hx = allocate<rpc::Buffer, std::byte> (buffer->size);
+      hx->size = buffer->size;
+      std::memcpy(hx->data(), buffer->data(), hx->size);
+      API::cast(connection).write(std::move(hx), [me = Me(this)](auto&& error) mutable {
         if (error) {
           me->onError(error);
         }
@@ -664,7 +677,7 @@ struct RpcConnectionImpl : RpcConnection::Impl {
     ptr += sizeof(rid);
     std::memcpy(ptr, &fid, sizeof(fid));
     {
-      //printf("send request %#x %#x\n", fid, rid);
+      //printf("send request %#x %#x\n", rid, fid);
       std::lock_guard l(reqMutex);
       if (dead.load(std::memory_order_relaxed)) {
         Error err("RPC call: connection is closed");
@@ -725,16 +738,39 @@ void RpcDeleter<RpcListener::Impl>::operator()(RpcListener::Impl* ptr) const noe
 struct Rpc::Impl {
   virtual ~Impl() = default;
 
-  SpinMutex mutex_;
+  alignas(64) SpinMutex mutex_;
   std::unordered_set<std::string> funcnames_;
   std::unordered_map<std::string_view, uint32_t> funcIds_;
   std::vector<std::unique_ptr<Rpc::FBase>> funcs_;
   static constexpr size_t maxFunctions_  = 0x100000;
-  uint32_t baseFuncId_ = random<uint32_t>(1, std::numeric_limits<uint32_t>::max() - maxFunctions_);
+  uint32_t baseFuncId_ = random<uint32_t>(Rpc::reqCallOffset, std::numeric_limits<uint32_t>::max() - maxFunctions_);
   uint32_t nextFuncIndex_ = 0;
 
-  SpinMutex remoteFuncsMutex_;
+  alignas(64) SpinMutex remoteFuncsMutex_;
   std::unordered_map<std::string_view, Rpc::RemoteFunction> remoteFuncs_;
+
+  struct Incoming {
+    Incoming* prev = nullptr;
+    Incoming* next = nullptr;
+    uint32_t rid;
+    std::chrono::steady_clock::time_point responseTimestamp;
+    SharedBufferHandle response;
+  };
+
+  struct IncomingBucket {
+    alignas(64) SpinMutex mutex;
+    std::unordered_map<uint32_t, Incoming> map;
+  };
+
+  alignas(64) std::array<IncomingBucket, 0x10> incoming_;
+  alignas(64) SpinMutex incomingFifoMutex_;
+  Incoming incomingFifo_;
+  std::atomic_size_t totalResponseSize_ = 0;
+
+  Impl() {
+    incomingFifo_.next = &incomingFifo_;
+    incomingFifo_.prev = &incomingFifo_;
+  }
 
   uint32_t functionId(std::string_view name) {
     std::lock_guard l(remoteFuncsMutex_);
@@ -771,6 +807,25 @@ struct Rpc::Impl {
   virtual void onRequest(RpcConnection::Impl& conn, uint32_t rid, uint32_t fid, const std::byte* ptr, size_t len) = 0;
 };
 
+namespace {
+template<typename T>
+void listInsert(T* at, T* item) {
+  T* next = at;
+  T* prev = at->prev;
+  next->prev = item;
+  prev->next = item;
+  item->next = next;
+  item->prev = prev;
+}
+template<typename T>
+void listErase(T* at) {
+  T* next = at->next;
+  T* prev = at->prev;
+  next->prev = prev;
+  prev->next = next;
+}
+}
+
 template<typename API>
 struct RpcImpl : Rpc::Impl {
   typename API::Context context;
@@ -790,11 +845,12 @@ struct RpcImpl : Rpc::Impl {
     return r;
   }
 
-  virtual void onRequest(RpcConnection::Impl& connx, uint32_t rid, uint32_t fid, const std::byte* ptr, size_t len) override {
+  virtual void onRequest(RpcConnection::Impl& connx, uint32_t rid, uint32_t fid, const std::byte* ptr, size_t len) noexcept override {
     //printf("onRequest rid %#x fid %#x %p %d\n", rid, fid, ptr, len);
     auto& conn = (RpcConnectionImpl<API>&)connx;
     rid &= ~(uint32_t)1;
-    if (fid == 0) {
+    if (fid == Rpc::reqFindFunction) {
+      //printf("find function\n");
       std::string_view name;
       deserializeBuffer(ptr, len, name);
       Rpc::RemoteFunction rf;
@@ -806,20 +862,80 @@ struct RpcImpl : Rpc::Impl {
         }
       }
       BufferHandle buffer;
-      serializeToBuffer(buffer, rid, rf.id, rf);
+      serializeToBuffer(buffer, rid, Rpc::reqSuccess, rf);
       conn.send(std::move(buffer));
-    } else {
+    } else if (fid == Rpc::reqAck) {
+      //printf("ack\n");
+      IncomingBucket& bucket = incoming_[rid % incoming_.size()];
+      std::lock_guard l(bucket.mutex);
+      auto i = bucket.map.find(rid);
+      if (i != bucket.map.end()) {
+        auto& x = i->second;
+        if (x.response) {
+          std::lock_guard l2(incomingFifoMutex_);
+          totalResponseSize_.fetch_sub(x.response->size, std::memory_order_relaxed);
+          listErase(&x);
+        }
+        bucket.map.erase(i);
+      } else {
+        //printf("bad ack\n");
+      }
+    } else if (fid == Rpc::reqPoke) {
+      IncomingBucket& bucket = incoming_[rid % incoming_.size()];
+      std::unique_lock l(bucket.mutex);
+      auto i = bucket.map.try_emplace(rid);
+      auto& x = i.first->second;
+      if (i.second) {
+        x.rid = rid;
+      } else {
+        if (x.response) {
+          SharedBufferHandle r = x.response;
+          l.unlock();
+          printf("re-sending response of %d bytes\n", r->size);
+          conn.send(r);
+        } else {
+          BufferHandle buffer;
+          serializeToBuffer(buffer, rid, Rpc::reqAck);
+          conn.send(std::move(buffer));
+        }
+        return;
+      }
+    } else if (fid >= (uint32_t)Rpc::reqCallOffset) {
       size_t index = fid - baseFuncId_;
       //printf("fid %#x has index %d\n", fid, index);
-      if (index >= funcs_.size()) {
+      Rpc::FBase* f = nullptr;
+      {
+        std::lock_guard l(mutex_);
+        if (index < funcs_.size()) {
+          f = &*funcs_[index];
+        }
+      }
+      if (!f) {
         BufferHandle buffer;
-        serializeToBuffer(buffer, rid, 0);
+        serializeToBuffer(buffer, rid, Rpc::reqFunctionNotFound);
         conn.send(std::move(buffer));
       } else {
-        Rpc::FBase* f;
         {
-          std::lock_guard l(mutex_);
-          f = &*funcs_[index];
+          IncomingBucket& bucket = incoming_[rid % incoming_.size()];
+          std::unique_lock l(bucket.mutex);
+          auto i = bucket.map.try_emplace(rid);
+          auto& x = i.first->second;
+          if (i.second) {
+            x.rid = rid;
+          } else {
+            if (x.response) {
+              SharedBufferHandle r = x.response;
+              l.unlock();
+              printf("re-sending response of %d bytes\n", r->size);
+              conn.send(r);
+            } else {
+              l.unlock();
+              BufferHandle buffer;
+              serializeToBuffer(buffer, rid, Rpc::reqAck);
+              conn.send(std::move(buffer));
+            }
+            return;
+          }
         }
         BufferHandle buffer;
         //printf("call with len %d\n", len);
@@ -828,7 +944,44 @@ struct RpcImpl : Rpc::Impl {
         std::memcpy(ptr, &rid, sizeof(rid));
 //        ptr += sizeof(rid);
 //        std::memcpy(ptr, &fid, sizeof(fid));
-        conn.send(std::move(buffer));
+        SharedBufferHandle shared(buffer.release());
+        //printf("sending response of %d bytes (%p)\n", shared->size, &*shared);
+        conn.send(shared);
+        {
+          auto now = std::chrono::steady_clock::now();
+          IncomingBucket& bucket = incoming_[rid % incoming_.size()];
+          std::lock_guard l(bucket.mutex);
+          auto& x = bucket.map[rid];
+          x.responseTimestamp = now;
+          size_t totalResponseSize = totalResponseSize_ += shared->size;
+          x.response = std::move(shared);
+          std::lock_guard l2(incomingFifoMutex_);
+          listInsert(incomingFifo_.prev, &x);
+
+          auto timeout = std::chrono::seconds(300);
+          if (now - incomingFifo_.next->responseTimestamp >= std::chrono::seconds(5)) {
+            if (totalResponseSize < 1024 * 1024 && incoming_.size() < 1024) {
+              timeout = std::chrono::seconds(1800);
+            } else if (totalResponseSize >= 1024 * 1024 * 1024 || incoming_.size() >= 1024 * 1024) {
+              timeout = std::chrono::seconds(5);
+            }
+            timeout = std::chrono::seconds(0);
+            while (incomingFifo_.next != &incomingFifo_ && now - incomingFifo_.next->responseTimestamp >= timeout) {
+              auto* i = incomingFifo_.next;
+              if (i->response) {
+                totalResponseSize_ -= i->response->size;
+              }
+              listErase(i);
+              auto& iBucket = incoming_[i->rid % incoming_.size()];
+              if (&iBucket != &bucket) {
+                std::lock_guard l3(iBucket.mutex);
+                iBucket.map.erase(i->rid);
+              } else {
+                iBucket.map.erase(i->rid);
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -842,8 +995,8 @@ void RpcListener::accept(Function<void(RpcConnection*, Error*)>&& callback) {
 Rpc::Rpc() {
   //impl_ = std::make_unique<RpcImpl<APIWrapper<API_Network>>>();
   //impl_ = std::make_unique<RpcImpl<APIWrapper<API_TPUV>>>();
-  impl_ = std::make_unique<RpcImpl<APIWrapper<API_TPSHM>>>();
-  //impl_ = std::make_unique<RpcImpl<APIWrapper<API_InProcess>>>();
+  //impl_ = std::make_unique<RpcImpl<APIWrapper<API_TPSHM>>>();
+  impl_ = std::make_unique<RpcImpl<APIWrapper<API_InProcess>>>();
 }
 Rpc::~Rpc() {}
 

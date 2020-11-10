@@ -26,18 +26,102 @@ struct Buffer {
   Buffer* next{nullptr};
   size_t capacity = 0;
   size_t size = 0;
+  std::atomic_int refcount{0};
   std::byte* data() {
     return dataptr<std::byte>(this);
   }
 };
 
-struct BufferDeleter {
-  void operator()(Buffer* ptr) const noexcept {
-    deallocate<Buffer, std::byte>(ptr);
+struct BufferHandle {
+  Buffer* buffer_ = nullptr;
+  BufferHandle() = default;
+  BufferHandle(Buffer* buffer) noexcept : buffer_(buffer) {}
+  BufferHandle(const BufferHandle&) = delete;
+  BufferHandle& operator=(const BufferHandle&) = delete;
+  BufferHandle(BufferHandle&& n) noexcept {
+    buffer_ = n.buffer_;
+    n.buffer_ = nullptr;
+  }
+  BufferHandle& operator=(BufferHandle&& n) noexcept {
+    std::swap(buffer_, n.buffer_);
+    return *this;
+  }
+  ~BufferHandle() {
+    if (buffer_) {
+      //printf("non shared deallocate\n");
+      deallocate<Buffer, std::byte>(buffer_);
+    }
+  }
+  explicit operator bool() const noexcept {
+    return buffer_;
+  }
+  Buffer* operator->() const noexcept {
+    return buffer_;
+  }
+  operator Buffer*() const noexcept {
+    return buffer_;
+  }
+  Buffer* release() noexcept {
+    Buffer* r = buffer_;
+    buffer_ = nullptr;
+    return r;
   }
 };
-
-using BufferHandle = std::unique_ptr<Buffer, BufferDeleter>;
+struct SharedBufferHandle {
+  Buffer* buffer_ = nullptr;
+  SharedBufferHandle() = default;
+  SharedBufferHandle(Buffer* buffer) noexcept : buffer_(buffer) {
+    if (buffer_) {
+      if (buffer->refcount != 0) std::abort();
+      addref();
+    }
+  }
+  SharedBufferHandle(const SharedBufferHandle& n) noexcept {
+    buffer_ = n.buffer_;
+    if (buffer_) {
+      addref();
+    }
+  }
+  SharedBufferHandle& operator=(const SharedBufferHandle& n) noexcept {
+    buffer_ = n.buffer_;
+    if (buffer_) {
+      addref();
+    }
+    return *this;
+  }
+  SharedBufferHandle(SharedBufferHandle&& n) noexcept {
+    buffer_ = n.buffer_;
+    n.buffer_ = nullptr;
+  }
+  SharedBufferHandle& operator=(SharedBufferHandle&& n) noexcept {
+    std::swap(buffer_, n.buffer_);
+    return *this;
+  }
+  ~SharedBufferHandle() {
+    if (buffer_ && decref() == 0) {
+      //printf("shared deallocate\n");
+      deallocate<Buffer, std::byte>(buffer_);
+    }
+  }
+  explicit operator bool() const noexcept {
+    return buffer_;
+  }
+  Buffer* operator->() const noexcept {
+    return buffer_;
+  }
+  operator Buffer*() const noexcept {
+    return buffer_;
+  }
+  int addref() noexcept {
+    return buffer_->refcount.fetch_add(1, std::memory_order_acquire) + 1;
+  }
+  int decref() noexcept {
+    int r = buffer_->refcount.fetch_sub(1, std::memory_order_release) - 1;
+    //printf("decref %p %d\n", this, r);
+    return r;
+    return buffer_->refcount.fetch_sub(1, std::memory_order_release) - 1;
+  }
+};
 
 template<typename... T>
 void serializeToBuffer(BufferHandle& buffer, const T&... v) {
@@ -85,9 +169,20 @@ struct Error: std::exception {
   }
 };
 
+template<typename R>
+using CallbackFunction = Function<void(R*, Error* error)>;
+
 struct RPCFunctionOptions {
   std::string_view name;
   int maxSimultaneousCalls = 0;
+};
+
+template<typename R>
+struct RpcCallOptions {
+  std::string_view name;
+  CallbackFunction<R> callback;
+  std::optional<std::chrono::milliseconds> timeout;
+  Function<void()> timeoutFunction;
 };
 
 struct Rpc;
@@ -112,8 +207,6 @@ struct RpcListener {
 
 struct Rpc {
 
-  template<typename R>
-  using CallbackFunction = Function<void(R*, Error* error)>;
   using ResponseCallback = Function<void(const void*, size_t, Error*)>;
 
   Rpc();
@@ -140,6 +233,17 @@ struct Rpc {
   template <typename F>
   struct FImpl;
 
+  enum {
+    reqError,
+    reqSuccess,
+    reqAck,
+    reqFunctionNotFound,
+    reqFindFunction,
+    reqPoke,
+
+    reqCallOffset = 1000,
+  };
+
   template <typename R, typename... Args>
   struct FImpl<R(Args...)> : FBase {
     Rpc& rpc;
@@ -157,9 +261,9 @@ struct Rpc {
       auto out = [&]() {
         if constexpr (std::is_same_v<void, R>) {
           std::apply(f, std::move(args));
-          serializeToBuffer(buffer, (uint32_t)0, (uint32_t)1);
+          serializeToBuffer(buffer, (uint32_t)0, (uint32_t)reqSuccess);
         } else {
-          serializeToBuffer(buffer, (uint32_t)0, (uint32_t)1, std::apply(f, std::move(args)));
+          serializeToBuffer(buffer, (uint32_t)0, (uint32_t)reqSuccess, std::apply(f, std::move(args)));
         }
       };
       if (rpc.currentExceptionMode_ == ExceptionMode::None) {
@@ -169,7 +273,7 @@ struct Rpc {
         try {
           in();
         } catch (const std::exception& e) {
-          serializeToBuffer(buffer, (uint32_t)0, (uint32_t)2, std::string_view(e.what()));
+          serializeToBuffer(buffer, (uint32_t)0, (uint32_t)reqError, std::string_view(e.what()));
           return;
         }
         out();
@@ -178,7 +282,7 @@ struct Rpc {
           in();
           out();
         } catch (const std::exception& e) {
-          serializeToBuffer(buffer, (uint32_t)0, (uint32_t)2, std::string_view(e.what()));
+          serializeToBuffer(buffer, (uint32_t)0, (uint32_t)reqError, std::string_view(e.what()));
         }
       }
     }
@@ -208,6 +312,7 @@ struct Rpc {
         callback(nullptr, error);
         return;
       }
+      //printf("request got a response of %d bytes\n", len);
       try {
         if constexpr (std::is_same_v<R, void>) {
           char nonnull;
@@ -234,7 +339,7 @@ struct Rpc {
       name = persistentString(name);
       BufferHandle buffer2;
       serializeToBuffer(buffer2, (uint32_t)0, (uint32_t)0, name);
-      asyncCallbackById<RemoteFunction>(conn, 0, std::move(buffer2), [this, &conn, name, buffer = std::move(buffer), callback = std::move(callback)](RemoteFunction* rf, Error* error) mutable noexcept {
+      asyncCallbackById<RemoteFunction>(conn, reqFindFunction, std::move(buffer2), [this, &conn, name, buffer = std::move(buffer), callback = std::move(callback)](RemoteFunction* rf, Error* error) mutable noexcept {
         if (!rf) {
           std::move(callback)(nullptr, error);
         } else {
