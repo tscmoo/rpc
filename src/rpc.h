@@ -1,11 +1,13 @@
 #pragma once
 
 //#include <tensorpipe/common/function.h>
-#include "tensorpipe/tensorpipe/common/function.h"
+
 
 #include "serialization.h"
 #include "allocator.h"
 #include "synchronization.h"
+#include "async.h"
+#include "function.h"
 
 #include <cstddef>
 #include <string_view>
@@ -18,9 +20,6 @@
 #include <mutex>
 
 namespace rpc {
-
-template<typename T>
-using Function = tensorpipe::Function<T>;
 
 struct Buffer {
   Buffer* next{nullptr};
@@ -227,7 +226,7 @@ struct Rpc {
 
   struct FBase {
     virtual ~FBase(){};
-    virtual void call(const std::byte*, size_t, BufferHandle& buffer) = 0;
+    virtual void call(BufferHandle, Function<void(BufferHandle)>) = 0;
   };
 
   template <typename F>
@@ -240,9 +239,13 @@ struct Rpc {
     reqFunctionNotFound,
     reqFindFunction,
     reqPoke,
+    reqNotFound,
 
     reqCallOffset = 1000,
   };
+
+
+  async::SchedulerFifo scheduler;
 
   template <typename R, typename... Args>
   struct FImpl<R(Args...)> : FBase {
@@ -251,40 +254,44 @@ struct Rpc {
     FImpl(Rpc& rpc, Function<R(Args...)>&& f) : rpc(rpc), f(std::move(f)) {
     }
     virtual ~FImpl() {}
-    virtual void call(const std::byte* ptr, size_t len, BufferHandle& buffer) noexcept override {
-      std::tuple<std::decay_t<Args>...> args;
-      auto in = [&]() {
-        std::apply([ptr, len](std::decay_t<Args>&... args) {
-          deserializeBuffer(ptr, len, args...);
-        }, args);
-      };
-      auto out = [&]() {
-        if constexpr (std::is_same_v<void, R>) {
-          std::apply(f, std::move(args));
-          serializeToBuffer(buffer, (uint32_t)0, (uint32_t)reqSuccess);
-        } else {
-          serializeToBuffer(buffer, (uint32_t)0, (uint32_t)reqSuccess, std::apply(f, std::move(args)));
-        }
-      };
-      if (rpc.currentExceptionMode_ == ExceptionMode::None) {
-        in();
-        out();
-      } else if (rpc.currentExceptionMode_ == ExceptionMode::DeserializationOnly) {
-        try {
-          in();
-        } catch (const std::exception& e) {
-          serializeToBuffer(buffer, (uint32_t)0, (uint32_t)reqError, std::string_view(e.what()));
-          return;
-        }
-        out();
-      } else {
-        try {
+    virtual void call(BufferHandle inbuffer, Function<void(BufferHandle)> callback) noexcept override {
+      rpc.scheduler.run([this, inbuffer = std::move(inbuffer), callback = std::move(callback)]() {
+        std::tuple<std::decay_t<Args>...> args;
+        auto in = [&]() {
+          std::apply([&](std::decay_t<Args>&... args) {
+            deserializeBuffer(std::move(inbuffer), args...);
+          }, args);
+        };
+        BufferHandle outbuffer;
+        auto out = [&]() {
+          if constexpr (std::is_same_v<void, R>) {
+            std::apply(f, std::move(args));
+            serializeToBuffer(outbuffer, (uint32_t)0, (uint32_t)reqSuccess);
+          } else {
+            serializeToBuffer(outbuffer, (uint32_t)0, (uint32_t)reqSuccess, std::apply(f, std::move(args)));
+          }
+        };
+        if (rpc.currentExceptionMode_ == ExceptionMode::None) {
           in();
           out();
-        } catch (const std::exception& e) {
-          serializeToBuffer(buffer, (uint32_t)0, (uint32_t)reqError, std::string_view(e.what()));
+        } else if (rpc.currentExceptionMode_ == ExceptionMode::DeserializationOnly) {
+          try {
+            in();
+          } catch (const std::exception& e) {
+            serializeToBuffer(outbuffer, (uint32_t)0, (uint32_t)reqError, std::string_view(e.what()));
+            return;
+          }
+          out();
+        } else {
+          try {
+            in();
+            out();
+          } catch (const std::exception& e) {
+            serializeToBuffer(outbuffer, (uint32_t)0, (uint32_t)reqError, std::string_view(e.what()));
+          }
         }
-      }
+        callback(std::move(outbuffer));
+      });
     }
   };
 
