@@ -191,18 +191,16 @@ struct RpcDeleter {
   void operator()(T*) const noexcept;
 };
 
-struct RpcConnection {
-  std::string localAddress() const;
-  std::string remoteAddress() const;
-  struct Impl;
-  std::unique_ptr<Impl, RpcDeleter<Impl>> impl_;
-};
+//struct RpcConnection {
+//  struct Impl;
+//  std::unique_ptr<Impl, RpcDeleter<Impl>> impl_;
+//};
 
-struct RpcListener {
-  void accept(Function<void(RpcConnection*, Error*)>&&);
-  struct Impl;
-  std::unique_ptr<Impl, RpcDeleter<Impl>> impl_;
-};
+//struct RpcListener {
+//  void accept(Function<void(RpcConnection*, Error*)>&&);
+//  struct Impl;
+//  std::unique_ptr<Impl, RpcDeleter<Impl>> impl_;
+//};
 
 struct Rpc {
 
@@ -211,8 +209,10 @@ struct Rpc {
   Rpc();
   ~Rpc();
 
-  RpcListener listen(std::string_view url);
-  RpcConnection connect(std::string_view url);
+  void setName(std::string_view name);
+  void setOnError(Function<void(const Error&)>&&);
+  void listen(std::string_view url);
+  void connect(std::string_view url);
 
   enum class ExceptionMode {
     None,
@@ -232,7 +232,7 @@ struct Rpc {
   template <typename F>
   struct FImpl;
 
-  enum {
+  enum ReqType : uint32_t {
     reqError,
     reqSuccess,
     reqAck,
@@ -271,10 +271,11 @@ struct Rpc {
             serializeToBuffer(outbuffer, (uint32_t)0, (uint32_t)reqSuccess, std::apply(f, std::move(args)));
           }
         };
-        if (rpc.currentExceptionMode_ == ExceptionMode::None) {
+        auto exceptionMode = rpc.currentExceptionMode_.load(std::memory_order_relaxed);
+        if (exceptionMode == ExceptionMode::None) {
           in();
           out();
-        } else if (rpc.currentExceptionMode_ == ExceptionMode::DeserializationOnly) {
+        } else if (exceptionMode == ExceptionMode::DeserializationOnly) {
           try {
             in();
           } catch (const std::exception& e) {
@@ -295,26 +296,19 @@ struct Rpc {
     }
   };
 
-  struct RemoteFunction {
-    uint32_t id = 0;
-    std::string typeId;
-
-    template<typename X>
-    void serialize(X& x) {
-      x(id, typeId);
-    }
-  };
-
   template<typename F>
   void define(std::string_view name, Function<F>&& f) {
     auto ff = std::make_unique<FImpl<F>>(*this, std::move(f));
     define(name, std::move(ff));
   }
 
-  template<typename R>
-  void asyncCallbackById(RpcConnection& conn, uint32_t fid, BufferHandle&& buffer, CallbackFunction<R> callback) {
-    //printf("asyncCallbackById fid %#x  %d bytes\n", fid, buffer->size);
-    sendRequest(conn, std::move(buffer), fid, [callback = std::move(callback)](const void* ptr, size_t len, Error* error) noexcept {
+  template<typename R, typename... Args>
+  void asyncCallback(std::string_view peerName, std::string_view functionName, CallbackFunction<R> callback, const Args&... args) {
+    BufferHandle buffer;
+    serializeToBuffer(buffer, (uint32_t)0, (uint32_t)0, args...);
+    //printf("original buffer size is %d\n", buffer->size);
+
+    sendRequest(peerName, functionName, std::move(buffer), [callback = std::move(callback)](const void* ptr, size_t len, Error* error) noexcept {
       if (error) {
         callback(nullptr, error);
         return;
@@ -336,49 +330,16 @@ struct Rpc {
     });
   }
 
-  template<typename R, typename... Args>
-  void asyncCallback(RpcConnection& conn, std::string_view name, CallbackFunction<R> callback, const Args&... args) {
-    BufferHandle buffer;
-    serializeToBuffer(buffer, (uint32_t)0, (uint32_t)0, args...);
-    //printf("original buffer size is %d\n", buffer->size);
-    uint32_t id = functionId(name);
-    if (id == 0) {
-      name = persistentString(name);
-      BufferHandle buffer2;
-      serializeToBuffer(buffer2, (uint32_t)0, (uint32_t)0, name);
-      asyncCallbackById<RemoteFunction>(conn, reqFindFunction, std::move(buffer2), [this, &conn, name, buffer = std::move(buffer), callback = std::move(callback)](RemoteFunction* rf, Error* error) mutable noexcept {
-        if (!rf) {
-          std::move(callback)(nullptr, error);
-        } else {
-          uint32_t id = rf->id;
-          //printf("got id %#x\n", id);
-          if (id == 0) {
-            Error err("RPC remote function '" + std::string(name) + "' does not exist");
-            std::move(callback)(nullptr, &err);
-            return;
-          }
-          setRemoteFunc(name, rf);
-          asyncCallbackById<R>(conn, id, std::move(buffer), std::move(callback));
-        }
-      });
-    } else {
-      asyncCallbackById<R>(conn, id, std::move(buffer), std::move(callback));
-    }
-  }
-
   struct Impl;
 
 private:
 
-  void sendRequest(RpcConnection& conn, BufferHandle&& buffer, uint32_t fid, ResponseCallback response);
+  void sendRequest(std::string_view peerName, std::string_view functionName, BufferHandle buffer, ResponseCallback response);
 
-  ExceptionMode currentExceptionMode_ = ExceptionMode::DeserializationOnly;
+  std::atomic<ExceptionMode> currentExceptionMode_ = ExceptionMode::DeserializationOnly;
   std::unique_ptr<Impl> impl_;
 
-  uint32_t functionId(std::string_view name);
   void define(std::string_view name, std::unique_ptr<FBase>&& f);
-  std::string_view persistentString(std::string_view str);
-  void setRemoteFunc(std::string_view name, RemoteFunction* rf);
 };
 
 
