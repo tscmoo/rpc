@@ -14,7 +14,7 @@ using SpinMutex = std::mutex;
 #elif __GNUC__ && __x86_64__
 
 class SpinMutex {
-  int lock_;
+  int lock_ = 0;
 public:
   void lock() {
     long tmp, tmp2;

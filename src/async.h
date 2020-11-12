@@ -11,6 +11,14 @@
 
 namespace async {
 
+inline void setCurrentThreadName(const std::string& name) {
+#ifdef __APPLE__
+  pthread_setname_np(name.c_str());
+#elif __linux__
+  pthread_setname_np(pthread_self(), name.c_str());
+#endif
+}
+
 template<typename T>
 using Function = rpc::Function<T>;
 using FunctionPointer = rpc::FunctionPointer;
@@ -54,12 +62,13 @@ struct ThreadPool {
     if (numThreads >= maxThreads) {
       return nullptr;
     }
-    ++numThreads;
+    int n = ++numThreads;
     threads.emplace_back();
     auto* t = &threads.back();
     t->n = threads.size() - 1;
     t->f = f;
-    t->thread = std::thread([l = std::move(l), t, waitFunction = std::forward<WaitFunction>(waitFunction)]() mutable {
+    t->thread = std::thread([l = std::move(l), n, t, waitFunction = std::forward<WaitFunction>(waitFunction)]() mutable {
+      setCurrentThreadName("async " + std::to_string(n));
       l.unlock();
       t->entry(std::move(waitFunction));
     });

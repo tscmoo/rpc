@@ -184,24 +184,6 @@ struct RpcCallOptions {
   Function<void()> timeoutFunction;
 };
 
-struct Rpc;
-
-template<typename T>
-struct RpcDeleter {
-  void operator()(T*) const noexcept;
-};
-
-//struct RpcConnection {
-//  struct Impl;
-//  std::unique_ptr<Impl, RpcDeleter<Impl>> impl_;
-//};
-
-//struct RpcListener {
-//  void accept(Function<void(RpcConnection*, Error*)>&&);
-//  struct Impl;
-//  std::unique_ptr<Impl, RpcDeleter<Impl>> impl_;
-//};
-
 struct Rpc {
 
   using ResponseCallback = Function<void(const void*, size_t, Error*)>;
@@ -211,8 +193,8 @@ struct Rpc {
 
   void setName(std::string_view name);
   void setOnError(Function<void(const Error&)>&&);
-  void listen(std::string_view url);
-  void connect(std::string_view url);
+  void listen(std::string_view addr);
+  void connect(std::string_view addr);
 
   enum class ExceptionMode {
     None,
