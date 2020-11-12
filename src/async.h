@@ -41,7 +41,7 @@ struct Thread {
 
 struct ThreadPool {
   std::atomic<Thread*> idle = nullptr;
-  std::mutex mutex;
+  rpc::SpinMutex mutex;
   std::list<Thread> threads;
   std::atomic_size_t numThreads = 0;
   size_t maxThreads = 0;
@@ -67,18 +67,20 @@ struct ThreadPool {
     auto* t = &threads.back();
     t->n = threads.size() - 1;
     t->f = f;
-    t->thread = std::thread([l = std::move(l), n, t, waitFunction = std::forward<WaitFunction>(waitFunction)]() mutable {
+    rpc::Semaphore sem;
+    t->thread = std::thread([&sem, n, t, waitFunction = std::forward<WaitFunction>(waitFunction)]() mutable {
       setCurrentThreadName("async " + std::to_string(n));
-      l.unlock();
+      sem.post();
       t->entry(std::move(waitFunction));
     });
+    sem.wait();
     return t;
   }
 };
 
 
 struct SchedulerFifo {
-  std::mutex mutex_;
+  rpc::SpinMutex mutex_;
   std::deque<FunctionPointer> queue_;
 
   ThreadPool pool;
