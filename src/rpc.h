@@ -233,6 +233,7 @@ struct Rpc {
   struct FImpl;
 
   enum ReqType : uint32_t {
+    reqGreeting,
     reqError,
     reqSuccess,
     reqAck,
