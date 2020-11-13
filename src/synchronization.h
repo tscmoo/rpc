@@ -9,7 +9,7 @@
 
 namespace rpc {
 
-#if 0
+#if 1
 using SpinMutex = std::mutex;
 #elif __GNUC__ && __x86_64__
 
@@ -76,7 +76,11 @@ class Semaphore {
     sem_post(&sem);
   }
   void wait() noexcept {
-    sem_wait(&sem);
+    while (sem_wait(&sem)) {
+      if (errno != EINTR) {
+        std::abort();
+      }
+    }
   }
   template<typename Rep, typename Period>
   void wait_for(const std::chrono::duration<Rep, Period>& duration) noexcept {

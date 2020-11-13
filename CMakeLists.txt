@@ -13,14 +13,15 @@ set(CMAKE_CXX_FLAGS
 
 set(TP_BUILD_BENCHMARK ON)
 
+add_subdirectory(src/fmt)
 add_subdirectory(src/tensorpipe)
 
 add_executable(rpctest src/test.cc)
 target_include_directories(rpctest PUBLIC src/tensorpipe)
-target_link_libraries(rpctest tensorpipe)
+target_link_libraries(rpctest fmt tensorpipe)
 
 add_executable(rpctest2 src/test2.cc src/rpc.cc src/network.cc)
 target_include_directories(rpctest2 PUBLIC src/tensorpipe src)
-target_link_libraries(rpctest2 tensorpipe)
+target_link_libraries(rpctest2 fmt tensorpipe)
 
 

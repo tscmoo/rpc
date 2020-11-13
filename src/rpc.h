@@ -223,6 +223,8 @@ struct Rpc {
     reqFindFunction,
     reqPoke,
     reqNotFound,
+    reqLookingForPeer,
+    reqPeerFound,
 
     reqCallOffset = 1000,
   };
@@ -285,8 +287,8 @@ struct Rpc {
     define(name, std::move(ff));
   }
 
-  template<typename R, typename... Args>
-  void asyncCallback(std::string_view peerName, std::string_view functionName, CallbackFunction<R> callback, const Args&... args) {
+  template<typename R, typename T, typename... Args>
+  void asyncCallback(std::string_view peerName, std::string_view functionName, T callback, const Args&... args) {
     BufferHandle buffer;
     serializeToBuffer(buffer, (uint32_t)0, (uint32_t)0, args...);
     //printf("original buffer size is %d\n", buffer->size);
