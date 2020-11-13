@@ -29,12 +29,15 @@ struct Thread {
   FunctionPointer f;
   std::thread thread;
   int n = 0;
+  std::atomic<bool> waiting = false;
   template<typename WaitFunction>
   void entry(WaitFunction&& waitFunction) noexcept {
     while (true) {
       Function<void()>{f}();
       f = nullptr;
+      waiting = true;
       waitFunction(this);
+      waiting = false;
     }
   }
 };
@@ -60,6 +63,8 @@ struct ThreadPool {
   Thread* addThread(FunctionPointer f, WaitFunction&& waitFunction) noexcept {
     std::unique_lock l(mutex);
     if (numThreads >= maxThreads) {
+      printf("throw away function!?\n");
+      std::abort();
       return nullptr;
     }
     int n = ++numThreads;
@@ -116,21 +121,39 @@ struct SchedulerFifo {
     while (idle && !pool.idle.compare_exchange_weak(idle, idle->next.load(std::memory_order_acquire)));
     if (idle) {
       idle->f = f.release();
+      if (!idle->f) {
+        printf("queue null function 1\n");
+        std::abort();
+      }
+      if (!idle->waiting) {
+        printf("thread is not waiting 1\n");
+        std::abort();
+      }
       idle->sem.post();
     } else {
       if (pool.numThreads.load(std::memory_order_relaxed) < pool.maxThreads) {
-        idle = pool.addThread(f.release(), [this](Thread* t) {
+        auto ptr = f.release();
+        idle = pool.addThread(ptr, [this](Thread* t) {
           wait(t);
         });
         if (idle) {
           return;
         }
+        f = ptr;
       }
       std::lock_guard l(mutex_);
-      Thread* idle = pool.idle.load(std::memory_order_acquire);
+      idle = pool.idle.load(std::memory_order_acquire);
       while (idle && !pool.idle.compare_exchange_weak(idle, idle->next.load(std::memory_order_acquire)));
       if (idle) {
         idle->f = f.release();
+        if (!idle->f) {
+          printf("queue null function 2\n");
+          std::abort();
+        }
+        if (!idle->waiting) {
+          printf("thread is not waiting 2\n");
+          std::abort();
+        }
         idle->sem.post();
       } else {
         queue_.push_back(f.release());

@@ -90,7 +90,14 @@ class Semaphore {
     auto seconds = std::chrono::duration_cast<std::chrono::seconds>(nanoseconds);
     ts.tv_sec = seconds.count();
     ts.tv_nsec = (nanoseconds - seconds).count();
-    sem_timedwait(&sem, &ts);
+    while (sem_timedwait(&sem, &ts)) {
+      if (errno == ETIMEDOUT) {
+        break;
+      }
+      if (errno != EINTR) {
+        std::abort();
+      }
+    }
   }
   template<typename Clock, typename Duration>
   void wait_until(const std::chrono::time_point<Clock, Duration>& timePoint) noexcept {

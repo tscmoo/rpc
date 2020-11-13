@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD 17)
 #    "${CMAKE_CXX_FLAGS} -pg")
 
 set(CMAKE_CXX_FLAGS
-    "${CMAKE_CXX_FLAGS} -Wfatal-errors")
+    "${CMAKE_CXX_FLAGS} -Wfatal-errors -fsanitize=thread")
 
 
 set(TP_BUILD_BENCHMARK ON)
