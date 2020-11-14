@@ -76,7 +76,11 @@ class Semaphore {
     sem_post(&sem);
   }
   void wait() noexcept {
-    sem_wait(&sem);
+    while (sem_wait(&sem)) {
+      if (errno != EINTR) {
+        std::abort();
+      }
+    }
   }
   template<typename Rep, typename Period>
   void wait_for(const std::chrono::duration<Rep, Period>& duration) noexcept {
@@ -86,7 +90,14 @@ class Semaphore {
     auto seconds = std::chrono::duration_cast<std::chrono::seconds>(nanoseconds);
     ts.tv_sec = seconds.count();
     ts.tv_nsec = (nanoseconds - seconds).count();
-    sem_timedwait(&sem, &ts);
+    while (sem_timedwait(&sem, &ts)) {
+      if (errno == ETIMEDOUT) {
+        break;
+      }
+      if (errno != EINTR) {
+        std::abort();
+      }
+    }
   }
   template<typename Clock, typename Duration>
   void wait_until(const std::chrono::time_point<Clock, Duration>& timePoint) noexcept {
