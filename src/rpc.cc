@@ -18,8 +18,11 @@
 
 namespace rpc {
 
+std::mutex logMutex;
+
 template<typename... Args>
 void log(const char* fmt, Args&&... args) {
+  std::lock_guard l(logMutex);
   time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
   auto* tm = std::localtime(&now);
   char buf[0x40];
@@ -626,7 +629,7 @@ struct Connection {
   bool outgoing = false;
   std::string addr;
   std::atomic<bool> hasConn = false;
-  std::unique_ptr<RpcConnectionImplBase> conn;
+  std::vector<std::unique_ptr<RpcConnectionImplBase>> conns;
 
   std::vector<std::string_view> remoteAddresses;
 
@@ -819,7 +822,7 @@ struct PeerImpl {
   bool send(std::chrono::steady_clock::time_point now, Buffer& buffer) {
     auto& x = connections_[index<API>];
     std::unique_lock l(x.mutex);
-    if (!x.conn) {
+    if (x.conns.empty()) {
       x.lastTryConnect = now;
       if (x.remoteAddresses.empty()) {
         x.valid = false;
@@ -838,13 +841,20 @@ struct PeerImpl {
       }
       return false;
     } else {
-      if (x.conn->dead.load(std::memory_order_relaxed)) {
+      size_t i = threadRandom<size_t>(0, x.conns.size() - 1);
+      auto& c = x.conns[i];
+      if (c->dead.load(std::memory_order_relaxed)) {
         log("Connection through %s to %s is dead, yo!\n", connectionTypeName[index<API>], name);
-        x.hasConn = false;
-        throwAway(std::move(x.conn));
+        auto cv = std::move(c);
+        std::swap(x.conns.back(), x.conns[i]);
+        x.conns.pop_back();
+        if (x.conns.empty()) {
+          x.hasConn = false;
+        }
+        throwAway(std::move(cv));
         return false;
       } else {
-        ((RpcConnectionImpl<API>&)*x.conn).send(std::move(buffer));
+        ((RpcConnectionImpl<API>&)*c).send(std::move(buffer));
         return true;
       }
     }
@@ -1420,9 +1430,9 @@ struct Rpc::Impl {
     auto cu = std::make_unique<RpcConnectionImpl<API>>(*u, u->context.connect(std::string(addr)));
     cu->greet(myName, myId, info_);
     cu->start();
-    c->conn = std::move(cu);
+    c->conns.push_back(std::move(cu));
     floatingConnections_.push_back(std::move(c));
-    floatingConnectionsMap_[&*floatingConnections_.back()->conn] = std::prev(floatingConnections_.end());
+    floatingConnectionsMap_[&*floatingConnections_.back()->conns.back()] = std::prev(floatingConnections_.end());
   }
 
   template<typename API, bool explicit_ = true>
@@ -1607,9 +1617,9 @@ struct Rpc::Impl {
       auto c = std::make_unique<Connection>();
       conn->greet(myName, myId, info_);
       conn->start();
-      c->conn = std::move(conn);
+      c->conns.push_back(std::move(conn));
       floatingConnections_.push_back(std::move(c));
-      floatingConnectionsMap_[&*floatingConnections_.back()->conn] = std::prev(floatingConnections_.end());
+      floatingConnectionsMap_[&*floatingConnections_.back()->conns.back()] = std::prev(floatingConnections_.end());
     }
   }
 
@@ -1668,13 +1678,17 @@ struct Rpc::Impl {
 
       if (peerId == myId) {
         std::lock_guard l(garbageMutex_);
-        garbageConnections_.push_back(std::move(cptr->conn));
+        for (auto& c : cptr->conns) {
+          garbageConnections_.push_back(std::move(c));
+        }
         log("I connected to myself! oops!\n");
         return;
       }
       if (peerName == myName) {
         std::lock_guard l(garbageMutex_);
-        garbageConnections_.push_back(std::move(cptr->conn));
+        for (auto& c : cptr->conns) {
+          garbageConnections_.push_back(std::move(c));
+        }
         log("Peer with same name as me! Refusing connection!\n");
         return;
       }
@@ -1686,7 +1700,7 @@ struct Rpc::Impl {
         peer.info = std::move(info);
         peer.hasId = true;
       }
-      if (&conn != &*cptr->conn) {
+      if (&conn != &*cptr->conns.back()) {
         std::abort();
       }
       conn.peer = &peer;
@@ -1696,11 +1710,10 @@ struct Rpc::Impl {
         std::lock_guard l(x.mutex);
         x.outgoing = cptr->outgoing;
         x.addr = std::move(cptr->addr);
-        if (x.conn) {
-          oldconn = std::move(x.conn);
+        for (auto& c : cptr->conns) {
+          x.conns.push_back(std::move(c));
         }
         x.hasConn = true;
-        x.conn = std::move(cptr->conn);
         x.valid = true;
       }
       if (oldconn) {
@@ -1817,12 +1830,11 @@ struct Rpc::Impl {
     bool anySuccess = false;
 
     if (!peerList.empty()) {
-      size_t nToKeep = std::max((size_t)std::ceil(std::log2(n)), (size_t)1);
-      n = peerList.size();
+      size_t nToKeep = std::max((size_t)std::ceil(std::log2(n)), peerList.size());
       nToKeep = std::max(nToKeep, std::min(n, (size_t)8));
-      while (n > nToKeep) {
-        std::swap(peerList.back(), peerList.at(threadRandom<size_t>(0, n - 1)));
-        --n;
+      while (peerList.size() > nToKeep) {
+        std::swap(peerList.back(), peerList.at(threadRandom<size_t>(0, peerList.size() - 1)));
+        peerList.pop_back();
       }
       log("looking among %d peers\n", peerList.size());
       BufferHandle buffer;
