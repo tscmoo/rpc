@@ -1863,7 +1863,7 @@ struct Rpc::Impl {
 
     if (!peerList.empty()) {
       size_t nToKeep = std::min((size_t)std::ceil(std::log2(n)), peerList.size());
-      //nToKeep = std::max(nToKeep, std::min(n, (size_t)8));
+      nToKeep = std::max(nToKeep, std::min(n, (size_t)2));
       while (peerList.size() > nToKeep) {
         std::swap(peerList.back(), peerList.at(threadRandom<size_t>(0, peerList.size() - 1)));
         peerList.pop_back();
@@ -1962,8 +1962,9 @@ struct RpcImpl : RpcImplBase {
     Connection& cx = peer.connections_[index<API>];
     std::lock_guard l(cx.latencyMutex);
 
-    float t = std::chrono::duration_cast<std::chrono::duration<float, std::ratio<10, 1>>>(now - cx.lastUpdateLatency).count();
-    float a = std::pow(0.5f, t);
+    float t = std::chrono::duration_cast<std::chrono::duration<float, std::ratio<1, 1>>>(now - cx.lastUpdateLatency).count();
+    cx.lastUpdateLatency = now;
+    float a = std::pow(0.25f, std::min(t, 0.25f));
     if (!std::isfinite(a)) {
       a = 0.0f;
     }
@@ -1984,7 +1985,7 @@ struct RpcImpl : RpcImplBase {
     float banditValue = cx.writeBanditValue * a + r * (1.0f - a);
     cx.writeBanditValue = banditValue;
     if (std::abs(banditValue - cx.readBanditValue.load(std::memory_order_relaxed)) >= 0.001f) {
-      //log("update bandit value -> %g\n", banditValue);
+      //log("update bandit value %g -> %g\n", cx.readBanditValue.load(), banditValue);
       cx.readBanditValue.store(banditValue, std::memory_order_relaxed);
     } else {
       //log("bandit value of %g does not need update\n", cx.readBanditValue.load(std::memory_order_relaxed));
