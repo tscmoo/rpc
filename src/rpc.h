@@ -287,13 +287,13 @@ struct Rpc {
     define(name, std::move(ff));
   }
 
-  template<typename R, typename T, typename... Args>
-  void asyncCallback(std::string_view peerName, std::string_view functionName, T callback, const Args&... args) {
+  template<typename R, typename Callback, typename... Args>
+  void asyncCallback(std::string_view peerName, std::string_view functionName, Callback&& callback, const Args&... args) {
     BufferHandle buffer;
     serializeToBuffer(buffer, (uint32_t)0, (uint32_t)0, args...);
     //printf("original buffer size is %d\n", buffer->size);
 
-    sendRequest(peerName, functionName, std::move(buffer), [callback = std::move(callback)](const void* ptr, size_t len, Error* error) noexcept {
+    sendRequest(peerName, functionName, std::move(buffer), [callback = std::forward<Callback>(callback)](const void* ptr, size_t len, Error* error) noexcept {
       if (error) {
         callback(nullptr, error);
         return;

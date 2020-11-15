@@ -9,7 +9,7 @@
 
 namespace rpc {
 
-#if 1
+#if 0
 using SpinMutex = std::mutex;
 #elif __GNUC__ && __x86_64__
 

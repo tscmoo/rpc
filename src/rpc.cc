@@ -1484,13 +1484,6 @@ struct Rpc::Impl {
     auto ul = u->context.listen(std::string(addr));
     std::lock_guard l(listenersMutex_);
     auto& x = listeners_.at(index<API>);
-//    if (x.listener) {
-//      if constexpr (!explicit_) {
-//        return false;
-//      } else {
-//        throw std::runtime_error("Already listening on backend " + std::string(connectionTypeName.at(index<API>)));
-//      }
-//    }
     std::unique_ptr<RpcListenerImpl<API>> i;
     try {
       i = std::make_unique<RpcListenerImpl<API>>(*u, std::move(ul), addr);
