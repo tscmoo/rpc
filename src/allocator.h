@@ -17,12 +17,13 @@ struct Storage {
   Header* allocate(size_t n) {
     //printf("allocate %p %s %d\n", this, typeid(*this).name(), n);
     static_assert(alignof(Header) >= alignof(Data));
-//    Header* h = (Header*)std::malloc(sizeof(Header) + sizeof(Data) * n);
-//    h->capacity = n;
-//    return h;
+    Header* h = (Header*)std::aligned_alloc(64, sizeof(Header) + sizeof(Data) * n);
+    new (h) Header();
+    h->capacity = n;
+    return h;
     Header* r = freelist;
     if (!r) {
-      r = (Header*)std::malloc(sizeof(Header) + sizeof(Data) * n);
+      r = (Header*)std::aligned_alloc(64, sizeof(Header) + sizeof(Data) * n);
       new (r) Header();
     } else {
       freelist = r->next;
@@ -32,7 +33,7 @@ struct Storage {
         }
         r->~Header();
         std::free(r);
-        r = (Header*)std::malloc(sizeof(Header) + sizeof(Data) * n);
+        r = (Header*)std::aligned_alloc(64, sizeof(Header) + sizeof(Data) * n);
         new (r) Header();
       }
     }
@@ -47,8 +48,8 @@ struct Storage {
     if (ptr->refcount != 0) {
       std::abort();
     }
-//    std::free(ptr);
-//    return;
+    std::free(ptr);
+    return;
     ptr->next = freelist;
     freelist = ptr;
   }

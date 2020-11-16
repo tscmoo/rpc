@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdlib>
+#include <new>
 
 namespace rpc {
 
@@ -32,6 +33,25 @@ struct Buffer {
   }
 };
 
+inline void destroyBuffer(Buffer* buffer) noexcept {
+  if (buffer->nTensors) {
+    for (size_t i = buffer->nTensors; i;) {
+      --i;
+      buffer->tensors()[i].~TensorRef();
+    }
+    buffer->nTensors = 0;
+  }
+}
+
+inline void shrinkBuffer(Buffer* buffer, size_t size, size_t nTensors) {
+  for (size_t i = buffer->nTensors; i != nTensors;) {
+    --i;
+    buffer->tensors()[i].~TensorRef();
+  }
+  buffer->nTensors = nTensors;
+  buffer->size = size;
+}
+
 struct BufferHandle {
   Buffer* buffer_ = nullptr;
   BufferHandle() = default;
@@ -49,7 +69,7 @@ struct BufferHandle {
   }
   ~BufferHandle() {
     if (buffer_) {
-      //printf("non shared deallocate\n");
+      destroyBuffer(buffer_);
       deallocate<Buffer, std::byte>(buffer_);
     }
   }
@@ -103,7 +123,7 @@ struct SharedBufferHandle {
   }
   ~SharedBufferHandle() {
     if (buffer_ && decref() == 0) {
-      //printf("shared deallocate\n");
+      destroyBuffer(buffer_);
       deallocate<Buffer, std::byte>(buffer_);
     }
   }
@@ -120,11 +140,24 @@ struct SharedBufferHandle {
     return buffer_->refcount.fetch_add(1, std::memory_order_acquire) + 1;
   }
   int decref() noexcept {
-    int r = buffer_->refcount.fetch_sub(1, std::memory_order_release) - 1;
-    //printf("decref %p %d\n", this, r);
-    return r;
     return buffer_->refcount.fetch_sub(1, std::memory_order_release) - 1;
   }
 };
+
+inline BufferHandle makeBuffer(size_t size, size_t nTensors) noexcept {
+  size_t allocsize = size;
+  if (nTensors) {
+    allocsize = Buffer::roundUpSizeForTensors(allocsize) + sizeof(TensorRef) * nTensors;
+  }
+  BufferHandle buffer{allocate<Buffer, std::byte>(allocsize)};
+  buffer->size = size;
+  buffer->nTensors = nTensors;
+  if (nTensors) {
+    for (size_t i = 0; i != nTensors; ++i) {
+      new (buffer->tensors() + i) TensorRef{};
+    }
+  }
+  return buffer;
+}
 
 }

@@ -82,6 +82,7 @@ struct Rpc {
     reqError,
     reqSuccess,
     reqAck,
+    reqNack,
     reqFunctionNotFound,
     reqFindFunction,
     reqPoke,

@@ -102,24 +102,14 @@ template <typename X> void serialize(X& x, const torch::Tensor& v) {
   bool inlined = size <= 4096;
   bool contiguous = v.is_contiguous();
   x(inlined, contiguous);
-  if (contiguous) {
-    printf("tensor is contiguous\n");
-    for (auto& v : v.strides()) {
-      printf(" stride %d\n", v);
-    }
-  } else {
-    printf("tensor is not contiguous\n");
-  }
   if (inlined) {
     void* data = v.data_ptr();
-    printf("inlining tensor\n");
     if (contiguous) {
       x(v.scalar_type(), v.sizes(), std::string_view((const char*)data, size));
     } else {
       x(v.scalar_type(), v.sizes(), v.strides(), std::string_view((const char*)data, size));
     }
   } else {
-    printf("outlining tensor at %d\n", x.tell());
     x.addTensor(v, x.tell());
     if (contiguous) {
       x(v.scalar_type(), v.sizes(), v.strides());
@@ -393,11 +383,11 @@ void serializeToBuffer(BufferHandle& buffer, const T&... v) {
   (x(v), ...);
   size_t size = x.dst - (std::byte*)nullptr;
   size_t nTensors = x.tensors - (TensorRef*)nullptr;
-  if (!buffer || buffer->capacity < size) {
-    buffer = BufferHandle(rpc::allocate<Buffer, std::byte>(Buffer::roundUpSizeForTensors(size) + sizeof(TensorRef) * nTensors));
+  if (!buffer || buffer->capacity < size || nTensors < buffer->nTensors) {
+    buffer = makeBuffer(size, nTensors);
+  } else {
+    shrinkBuffer(buffer, size, nTensors);
   }
-  buffer->nTensors = nTensors;
-  buffer->size = size;
   std::byte* dst = buffer->data();
   Serialize<OpWrite> x2{dst, dst, buffer->tensors()};
   (x2(v), ...);
