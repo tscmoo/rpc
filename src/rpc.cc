@@ -844,7 +844,7 @@ struct PeerImpl {
     } else {
       size_t i = threadRandom<size_t>(0, x.conns.size() - 1);
       auto& c = x.conns[i];
-      if (c->dead.load(std::memory_order_relaxed) || now - c->lastReceivedData >= std::chrono::seconds(2)) {
+      if (c->dead.load(std::memory_order_relaxed) || now - c->lastReceivedData >= std::chrono::seconds(15)) {
         log("Connection through %s to %s is dead, yo!\n", connectionTypeName[index<API>], name);
         auto cv = std::move(c);
         std::swap(x.conns.back(), x.conns[i]);
@@ -1161,6 +1161,17 @@ struct Rpc::Impl {
     std::chrono::steady_clock::time_point responseTimestamp;
     SharedBufferHandle responseBuffer;
     PeerImpl* peer = nullptr;
+    bool called = false;
+
+    struct TensorData {
+      BufferHandle buffer;
+      size_t offset;
+      std::string_view data;
+    };
+
+    BufferHandle requestBuffer;
+    std::vector<TensorData> tensorData;
+    uint32_t receivedTensors = 0;
   };
 
   struct IncomingBucket {
@@ -1179,6 +1190,11 @@ struct Rpc::Impl {
   std::atomic<std::chrono::steady_clock::time_point> timeout_ = std::chrono::steady_clock::now();
   std::atomic<bool> timeoutDead_ = false;
 
+  struct OutgoingTensor {
+    bool acked = false;
+    SharedBufferHandle requestbuffer;
+  };
+
   struct Outgoing {
     Outgoing* prev = nullptr;
     Outgoing* next = nullptr;
@@ -1195,6 +1211,7 @@ struct Rpc::Impl {
     PeerImpl* peer = nullptr;
     SharedBufferHandle requestBuffer;
     int timeoutCount = 0;
+    std::vector<OutgoingTensor> tensors;
   };
 
   struct OutgoingBucket {
@@ -1520,13 +1537,42 @@ struct Rpc::Impl {
     return (RpcImpl<API>*)&*rpcs_.at(index<API>);
   }
 
+  size_t computeStorageNbytes(
+      torch::IntArrayRef sizes,
+      torch::IntArrayRef strides,
+      size_t itemsize_bytes) {
+    // size of the underlying storage is 1 bigger than the offset
+    // of the last element according to stride
+    size_t size = 1;
+    for(size_t i = 0; i < sizes.size(); i++) {
+      if(sizes[i] == 0) {
+        return 0;
+      }
+      size += strides[i]*(sizes[i]-1);
+    }
+    return size * itemsize_bytes;
+  }
+
   void sendRequest(PeerImpl& peer, uint32_t fid, BufferHandle buffer, rpc::Rpc::ResponseCallback response) noexcept {
+    if (buffer->size != (uint32_t)buffer->size) {
+      throw std::runtime_error("RPC request is too large!");
+    }
     auto* ptr = dataptr<std::byte>(&*buffer);
     uint32_t rid = sequenceId.fetch_add(1, std::memory_order_relaxed) << 1 | 1;
     auto* ridPtr = ptr;
     std::memcpy(ptr, &rid, sizeof(rid));
     ptr += sizeof(rid);
     std::memcpy(ptr, &fid, sizeof(fid));
+    ptr += sizeof(fid);
+    uint32_t nTensors = buffer->nTensors;
+    if (fid >= Rpc::reqCallOffset) {
+      std::memcpy(ptr, &nTensors, sizeof(nTensors));
+      ptr += sizeof(nTensors);
+    } else {
+      if (nTensors) {
+        std::abort();
+      }
+    }
     auto now = std::chrono::steady_clock::now();
     auto myTimeout = now + std::chrono::seconds(1);
     {
@@ -1537,15 +1583,8 @@ struct Rpc::Impl {
 //        return;
 //      }
       SharedBufferHandle shared(buffer.release());
-      size_t index = -1;
-      if (peer.banditSend(~0, shared, &index)) {
-        myTimeout = now + std::chrono::milliseconds((int)std::ceil(peer.connections_.at(index).runningLatency.load(std::memory_order_relaxed) * 4));
-        myTimeout = std::min(myTimeout, now + std::chrono::seconds(2));
-      } else {
-        myTimeout = now + std::chrono::milliseconds(100);
-      }
       auto& oBucket = getBucket(outgoing_, rid);
-      std::lock_guard l(oBucket.mutex);
+      std::unique_lock l(oBucket.mutex);
       auto in = oBucket.map.try_emplace(rid);
       while (!in.second) {
         rid = sequenceId.fetch_add(1, std::memory_order_relaxed) << 1 | 1;
@@ -1556,9 +1595,41 @@ struct Rpc::Impl {
       q.rid = rid;
       q.peer = &peer;
       q.requestTimestamp = now;
-      q.timeout = myTimeout;
+      q.timeout = now + std::chrono::milliseconds(100);
       q.response = std::move(response);
-      q.requestBuffer = std::move(shared);
+      q.requestBuffer = shared;
+
+      l.unlock();
+
+//      size_t index = -1;
+//      if (peer.banditSend(~0, std::move(shared), &index)) {
+//        myTimeout = now + std::chrono::milliseconds((int)std::ceil(peer.connections_.at(index).runningLatency.load(std::memory_order_relaxed) * 4));
+//        myTimeout = std::min(myTimeout, now + std::chrono::seconds(2));
+//      } else {
+//        myTimeout = now + std::chrono::milliseconds(100);
+//      }
+
+      if (nTensors) {
+        for (uint32_t i = 0; i != nTensors; ++i) {
+          auto& tensorRef = shared->tensors()[i];
+          auto& tensor = tensorRef.tensor;
+          size_t nBytes = computeStorageNbytes(tensor.sizes(), tensor.strides(), tensor.itemsize());
+          serializeToBuffer(buffer, rid, fid, (uint32_t)~0, i, (uint32_t)tensorRef.offset, std::string_view((const char*)tensor.data_ptr(), nBytes));
+
+          SharedBufferHandle shared2(buffer.release());
+
+          l.lock();
+          q.tensors.emplace_back();
+          auto& qt = q.tensors.back();
+          qt.requestbuffer = shared2;
+          l.unlock();
+
+          log("send tensor %d\n", i);
+          peer.banditSend(~0, std::move(shared2));
+        }
+      }
+
+      peer.banditSend(~0, std::move(shared));
     }
     //log("myTimeout is in %d\n", std::chrono::duration_cast<std::chrono::milliseconds>(myTimeout - now).count());
     static_assert(std::atomic<std::chrono::steady_clock::time_point>::is_always_lock_free);
@@ -1603,7 +1674,7 @@ struct Rpc::Impl {
           uint32_t fid = rf.id;
           //log("got id %#x\n", id);
           if (fid == 0) {
-            Error err("RPC remote function " + std::string(peer->name) + "::" + std::string(functionName) + "' does not exist");
+            Error err("RPC remote function " + std::string(peer->name) + "::'" + std::string(functionName) + "' does not exist");
             std::move(response)(nullptr, 0, &err);
             return;
           }
@@ -1871,7 +1942,7 @@ struct Rpc::Impl {
       log("looking among %d peers\n", peerList.size());
       BufferHandle buffer;
       serializeToBuffer(buffer, (uint32_t)1, (uint32_t)Rpc::reqLookingForPeer, nameList);
-      SharedBufferHandle shared = buffer.release();
+      SharedBufferHandle shared{buffer.release()};
       for (auto* p : peerList) {
         anySuccess |= p->banditSend(~0, shared);
       }
@@ -1999,6 +2070,7 @@ struct RpcImpl : RpcImplBase {
       // Look up function id by name
       std::string_view name;
       deserializeBuffer(ptr, len, name);
+      log("find function '%s'\n", name);
       RemoteFunction rf;
       {
         std::lock_guard l(rpc.mutex_);
@@ -2117,6 +2189,14 @@ struct RpcImpl : RpcImplBase {
       }
     } else if (fid >= (uint32_t)Rpc::reqCallOffset) {
       // RPC call
+      uint32_t nTensors;
+      auto view = deserializeBuffer(ptr, len, nTensors);
+      ptr = (const std::byte*)view.data();
+      len = view.size();
+      bool isTensor = nTensors == (uint32_t)~0;
+      if (isTensor) {
+        nTensors = 0;
+      }
       size_t index = fid - rpc.baseFuncId_;
       Rpc::FBase* f = nullptr;
       {
@@ -2126,9 +2206,11 @@ struct RpcImpl : RpcImplBase {
         }
       }
       if (!f) {
-        BufferHandle buffer;
-        serializeToBuffer(buffer, rid, Rpc::reqFunctionNotFound);
-        conn.send(std::move(buffer));
+        if (!isTensor) {
+          BufferHandle buffer;
+          serializeToBuffer(buffer, rid, Rpc::reqFunctionNotFound);
+          conn.send(std::move(buffer));
+        }
       } else {
         {
           Rpc::Impl::IncomingBucket& bucket = rpc.getBucket(rpc.incoming_, rid);
@@ -2138,6 +2220,7 @@ struct RpcImpl : RpcImplBase {
           if (i.second) {
             x.peer = &peer;
             x.rid = rid;
+            x.called = !isTensor && nTensors == 0;
             //log("new RPC call with rid %#x from %s!\n", rid, peer.name);
           } else {
             if (x.rid != rid) {
@@ -2147,76 +2230,170 @@ struct RpcImpl : RpcImplBase {
             if (x.peer != &peer) {
               log("peer %p vs %p\n", (void*)x.peer, (void*)&peer);
               log("rid collision on rpc call! (not fatal!)\n");
+              // but we probably need a rid collision message so that the client can change rid
               std::terminate();
             }
             bool hasResponse = x.responseBuffer != nullptr;
-            log("RPC call already known, hasResponse is %d\n", hasResponse);
-            l.unlock();
-            BufferHandle buffer;
-            serializeToBuffer(buffer, rid, Rpc::reqAck, hasResponse);
-            conn.send(std::move(buffer));
-            return;
+            if (x.called || hasResponse) {
+              l.unlock();
+              log("RPC call already known, hasResponse is %d\n", hasResponse);
+              BufferHandle buffer;
+              serializeToBuffer(buffer, rid, Rpc::reqAck, hasResponse);
+              conn.send(std::move(buffer));
+              return;
+            }
           }
         }
         BufferHandle buffer;
         serializeToBuffer(buffer, rid, Rpc::reqAck, false);
         conn.send(std::move(buffer));
         //log("call with len %d\n", len);
-        BufferHandle inbuffer = allocate<Buffer, std::byte>(len);
+        size_t allocsize = len;
+        if (nTensors) {
+          allocsize = Buffer::roundUpSizeForTensors(allocsize) + sizeof(TensorRef) * nTensors;
+        }
+        BufferHandle inbuffer{allocate<Buffer, std::byte>(allocsize)};
         std::memcpy(inbuffer->data(), ptr, len);
         inbuffer->size = len;
-        f->call(std::move(inbuffer), [this, peer = &peer, rid](BufferHandle outbuffer) {
-          auto* ptr = dataptr<std::byte>(&*outbuffer);
-          std::memcpy(ptr, &rid, sizeof(rid));
-  //        ptr += sizeof(rid);
-  //        std::memcpy(ptr, &fid, sizeof(fid));
-          SharedBufferHandle shared(outbuffer.release());
-          //log("sending response for rid %#x of %d bytes to %s\n", rid, shared->size, peer->name);
-          //conn->send(shared);
-          peer->banditSend(~0, shared);
-
-          auto now = std::chrono::steady_clock::now();
+        if (nTensors) {
+          for (size_t i = 0; i != nTensors; ++i) {
+            printf("placement new at [%d] %p\n", i, &inbuffer->tensors()[i]);
+            new (&inbuffer->tensors()[i]) TensorRef{};
+          }
+        }
+        bool doCall = false;
+        auto createTensors = [&](auto& x, auto& l) {
+          auto data = std::move(x.tensorData);
+          inbuffer = std::move(x.requestBuffer);
+          l.unlock();
+          for (size_t i = 0; i != data.size(); ++i) {
+            auto& d = data[i];
+            Deserializer des(std::string_view((const char*)inbuffer->data(), inbuffer->size));
+            Deserialize xd(des);
+            printf("inbuffer->size is %d, offset is %d\n", inbuffer->size, d.offset);
+            des.consume(d.offset - 12);
+            printf("tensor at [%d] %p\n", i, &inbuffer->tensors()[i]);
+            inbuffer->tensors()[i].tensor = serializeHelperAllocateTensor(xd, (std::byte*)d.data.data(), d.data.size(), std::move(d.buffer));
+            printf("created tensor %d\n", i);
+          }
+        };
+        if (!isTensor) {
+          if (nTensors) {
+            log("got request with %d tensors\n", nTensors);
+            Rpc::Impl::IncomingBucket& bucket = rpc.getBucket(rpc.incoming_, rid);
+            std::unique_lock l(bucket.mutex);
+            auto i = bucket.map.find(rid);
+            if (i != bucket.map.end()) {
+              auto& x = i->second;
+              if (x.called) {
+                BufferHandle buffer;
+                serializeToBuffer(buffer, rid, Rpc::reqAck, x.responseBuffer != nullptr);
+                conn.send(std::move(buffer));
+                return;
+              }
+              x.requestBuffer = std::move(inbuffer);
+              x.tensorData.resize(nTensors);
+              if (x.receivedTensors >= nTensors) {
+                log("got all %d tensors, let's go bitches!\n", nTensors);
+                x.called = true;
+                doCall = true;
+                createTensors(x, l);
+              }
+            }
+          } else {
+            doCall = true;
+          }
+        } else {
+          uint32_t tensorIndex;
+          uint32_t offset;
+          std::string_view data;
+          deserializeBuffer(inbuffer, tensorIndex, offset, data);
+          log("got tensor index %d offset %d data %d bytes\n", tensorIndex, offset, data.size());
+          log("first value is %g (%p)\n", *(float*)data.data(), data.data());
           Rpc::Impl::IncomingBucket& bucket = rpc.getBucket(rpc.incoming_, rid);
-          std::lock_guard l2(rpc.incomingFifoMutex_);
           std::unique_lock l(bucket.mutex);
-          size_t totalResponseSize;
           auto i = bucket.map.find(rid);
           if (i != bucket.map.end()) {
-            auto& x = bucket.map[rid];
-            x.responseTimestamp = now;
-            totalResponseSize = rpc.totalResponseSize_ += shared->size;
-            x.responseBuffer = std::move(shared);
-            listInsert(rpc.incomingFifo_.prev, &x);
-          } else {
-            totalResponseSize = rpc.totalResponseSize_;
-          }
-          l.unlock();
-
-          // Erase outgoing data if it has not been acknowledged within a
-          // certain time period. This prevents us from using resources
-          // for peers that are permanently gone.
-          auto timeout = std::chrono::seconds(300);
-          if (now - rpc.incomingFifo_.next->responseTimestamp >= std::chrono::seconds(5)) {
-            if (totalResponseSize < 1024 * 1024 && rpc.incoming_.size() < 1024) {
-              timeout = std::chrono::seconds(1800);
-            } else if (totalResponseSize >= 1024 * 1024 * 1024 || rpc.incoming_.size() >= 1024 * 1024) {
-              timeout = std::chrono::seconds(5);
+            auto& x = i->second;
+            if (x.called) {
+              BufferHandle buffer;
+              serializeToBuffer(buffer, rid, Rpc::reqAck, x.responseBuffer != nullptr);
+              conn.send(std::move(buffer));
+              return;
             }
-            timeout = std::chrono::seconds(0);
-            while (rpc.incomingFifo_.next != &rpc.incomingFifo_ && now - rpc.incomingFifo_.next->responseTimestamp >= timeout) {
-              auto* i = rpc.incomingFifo_.next;
-              listErase(i);
-              auto& iBucket = rpc.getBucket(rpc.incoming_, i->rid);
-              std::lock_guard l3(iBucket.mutex);
-              if (i->responseBuffer) {
-                rpc.totalResponseSize_ -= i->responseBuffer->size;
+            if (x.tensorData.size() <= tensorIndex) {
+              if (x.requestBuffer) {
+                log("received bad tensor\n");
+                bucket.map.erase(i);
+                std::abort();
+                return;
               }
-              iBucket.map.erase(i->rid);
-              log("permanent timeout of response !?\n");
-              std::abort();
+              x.tensorData.resize(std::max((size_t)tensorIndex + 16, x.tensorData.size() + x.tensorData.size() / 2));
+            }
+            x.tensorData[tensorIndex] = {std::move(inbuffer), offset, data};
+            ++x.receivedTensors;
+            if (x.requestBuffer && (size_t)x.receivedTensors >= x.tensorData.size()) {
+              log("do call yo got the last tensor\n");
+              x.called = true;
+              doCall = true;
+              createTensors(x, l);
             }
           }
-        });
+        }
+        if (doCall) {
+          f->call(std::move(inbuffer), [this, peer = &peer, rid](BufferHandle outbuffer) {
+            auto* ptr = dataptr<std::byte>(&*outbuffer);
+            std::memcpy(ptr, &rid, sizeof(rid));
+    //        ptr += sizeof(rid);
+    //        std::memcpy(ptr, &fid, sizeof(fid));
+            SharedBufferHandle shared(outbuffer.release());
+            //log("sending response for rid %#x of %d bytes to %s\n", rid, shared->size, peer->name);
+            //conn->send(shared);
+            peer->banditSend(~0, shared);
+
+            auto now = std::chrono::steady_clock::now();
+            Rpc::Impl::IncomingBucket& bucket = rpc.getBucket(rpc.incoming_, rid);
+            std::lock_guard l2(rpc.incomingFifoMutex_);
+            std::unique_lock l(bucket.mutex);
+            size_t totalResponseSize;
+            auto i = bucket.map.find(rid);
+            if (i != bucket.map.end()) {
+              auto& x = bucket.map[rid];
+              x.responseTimestamp = now;
+              totalResponseSize = rpc.totalResponseSize_ += shared->size;
+              x.responseBuffer = std::move(shared);
+              listInsert(rpc.incomingFifo_.prev, &x);
+            } else {
+              totalResponseSize = rpc.totalResponseSize_;
+            }
+            l.unlock();
+
+            // Erase outgoing data if it has not been acknowledged within a
+            // certain time period. This prevents us from using resources
+            // for peers that are permanently gone.
+            auto timeout = std::chrono::seconds(300);
+            if (now - rpc.incomingFifo_.next->responseTimestamp >= std::chrono::seconds(5)) {
+              if (totalResponseSize < 1024 * 1024 && rpc.incoming_.size() < 1024) {
+                timeout = std::chrono::seconds(1800);
+              } else if (totalResponseSize >= 1024 * 1024 * 1024 || rpc.incoming_.size() >= 1024 * 1024) {
+                timeout = std::chrono::seconds(5);
+              }
+              timeout = std::chrono::seconds(0);
+              while (rpc.incomingFifo_.next != &rpc.incomingFifo_ && now - rpc.incomingFifo_.next->responseTimestamp >= timeout) {
+                auto* i = rpc.incomingFifo_.next;
+                listErase(i);
+                auto& iBucket = rpc.getBucket(rpc.incoming_, i->rid);
+                std::lock_guard l3(iBucket.mutex);
+                if (i->responseBuffer) {
+                  rpc.totalResponseSize_ -= i->responseBuffer->size;
+                }
+                iBucket.map.erase(i->rid);
+                log("permanent timeout of response !?\n");
+                std::abort();
+              }
+            }
+          });
+        }
       }
     }
   }

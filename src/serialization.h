@@ -1,7 +1,9 @@
 
 #pragma once
 
-#include "allocator.h"
+#include "buffer.h"
+
+#include <torch/torch.h>
 
 #include <cstddef>
 #include <string_view>
@@ -79,6 +81,100 @@ void serialize(X& x, std::unordered_map<Key, Value>& v) {
   for (; n; --n) {
     auto k = x.template read<Key>();
     v.emplace(std::move(k), x.template read<Value>());
+  }
+}
+
+template <typename X, typename T> void serialize(X& x, torch::ArrayRef<T>& v) {
+  std::basic_string_view<T> v2;
+  x(v2);
+  v = torch::ArrayRef<T>(v2.data(), v2.size());
+}
+template <typename X, typename T> void serialize(X& x, const torch::ArrayRef<T>& v) {
+  x(std::basic_string_view<T>(v.data(), v.size()));
+}
+
+template <typename X> void serialize(X& x, const torch::Tensor& v) {
+  if (!v.device().is_cpu()) {
+    serialize(x, v.cpu());
+    return;
+  }
+  size_t size = v.numel() * v.dtype().itemsize();
+  bool inlined = size <= 4096;
+  bool contiguous = v.is_contiguous();
+  x(inlined, contiguous);
+  if (contiguous) {
+    printf("tensor is contiguous\n");
+    for (auto& v : v.strides()) {
+      printf(" stride %d\n", v);
+    }
+  } else {
+    printf("tensor is not contiguous\n");
+  }
+  if (inlined) {
+    void* data = v.data_ptr();
+    printf("inlining tensor\n");
+    if (contiguous) {
+      x(v.scalar_type(), v.sizes(), std::string_view((const char*)data, size));
+    } else {
+      x(v.scalar_type(), v.sizes(), v.strides(), std::string_view((const char*)data, size));
+    }
+  } else {
+    printf("outlining tensor at %d\n", x.tell());
+    x.addTensor(v, x.tell());
+    if (contiguous) {
+      x(v.scalar_type(), v.sizes(), v.strides());
+    } else {
+      x(v.scalar_type(), v.sizes(), v.strides());
+    }
+  }
+}
+
+template<typename X> torch::Tensor serializeHelperAllocateTensor(X& x, std::byte* data, size_t datalen, BufferHandle buffer) {
+  torch::Tensor t;
+  decltype(t.scalar_type()) dtype;
+  decltype(t.sizes()) sizes;
+  decltype(t.strides()) strides;
+  x(dtype, sizes, strides);
+
+  torch::DataPtr dataPtr(data, buffer.release(), [](void* ptr) {
+    Buffer* buf = (Buffer*)ptr;
+    BufferHandle{buf};
+  }, torch::DeviceType::CPU);
+  torch::Storage storage(torch::Storage::use_byte_size_t(), datalen, std::move(dataPtr), nullptr, false);
+
+  return torch::empty({0}, dtype).set_(std::move(storage), 0, sizes, strides);
+}
+
+template <typename X> void serialize(X& x, torch::Tensor& v) {
+  bool inlined, contiguous;
+  x(inlined, contiguous);
+
+  decltype(v.scalar_type()) dtype;
+  decltype(v.sizes()) sizes;
+  decltype(v.strides()) strides;
+  if (contiguous && inlined) {
+    x(dtype, sizes);
+  } else {
+    x(dtype, sizes, strides);
+  }
+
+  if (inlined) {
+    std::string_view data;
+    x(data);
+    if (v.defined() && v.scalar_type() == dtype) {
+      v.resize_(sizes);
+    } else {
+      v = torch::empty(sizes, dtype);
+    }
+    if (!contiguous) {
+      v.as_strided_(sizes, strides);
+    }
+    if ((size_t)v.numel() != data.size() / v.dtype().itemsize()) {
+      throw std::runtime_error("numel mismatch in tensor deserialize");
+    }
+    std::memcpy(v.data_ptr(), data.data(), data.size());
+  } else {
+    v = std::move(x.getTensor().tensor);
   }
 }
 
@@ -184,7 +280,9 @@ struct Deserializer {
 
 template<typename Op>
 struct Serialize {
+  std::byte* begin = nullptr;
   std::byte* dst = nullptr;
+  TensorRef* tensors = nullptr;
   template <typename T> static std::false_type has_serialize_f(...);
   template <typename T,
             typename = decltype(
@@ -217,9 +315,24 @@ struct Serialize {
   void operator()(const T&... v) {
     ((*this)(std::forward<const T&>(v)), ...);
   }
+
+  void addTensor(OpWrite, const torch::Tensor& x, size_t offset) {
+    new (tensors++) TensorRef{x, offset};
+  }
+  void addTensor(OpSize, [[maybe_unused]] const torch::Tensor& x, [[maybe_unused]] size_t offset) {
+    ++tensors;
+  }
+  void addTensor(const torch::Tensor& t, size_t offset) {
+    addTensor(Op{}, t, offset);
+  }
+
+  size_t tell() const {
+    return dst - begin;
+  }
 };
 
 struct Deserialize {
+  TensorRef* tensors = nullptr;
   Deserialize(Deserializer& des)
       : des(des) {
   }
@@ -268,7 +381,49 @@ struct Deserialize {
       return r;
     }
   }
+
+  TensorRef& getTensor() {
+    return *tensors++;
+  }
 };
 
+template<typename... T>
+void serializeToBuffer(BufferHandle& buffer, const T&... v) {
+  Serialize<OpSize> x{};
+  (x(v), ...);
+  size_t size = x.dst - (std::byte*)nullptr;
+  size_t nTensors = x.tensors - (TensorRef*)nullptr;
+  if (!buffer || buffer->capacity < size) {
+    buffer = BufferHandle(rpc::allocate<Buffer, std::byte>(Buffer::roundUpSizeForTensors(size) + sizeof(TensorRef) * nTensors));
+  }
+  buffer->nTensors = nTensors;
+  buffer->size = size;
+  std::byte* dst = buffer->data();
+  Serialize<OpWrite> x2{dst, dst, buffer->tensors()};
+  (x2(v), ...);
+}
+
+template<typename... T>
+BufferHandle serializeToBuffer(const T&... v) {
+  BufferHandle h;
+  serializeToBuffer(h, std::forward<const T&>(v)...);
+  return h;
+}
+
+template<typename... T>
+std::string_view deserializeBuffer(const void* ptr, size_t len, T&... result) {
+  Deserializer des(std::string_view{(const char*)ptr, len});
+  Deserialize x(des);
+  x(result...);
+  return des.buf;
+}
+template<typename... T>
+auto deserializeBuffer(Buffer* buffer, T&... result) {
+  Deserializer des(std::string_view{(const char*)buffer->data(), buffer->size});
+  Deserialize x(des);
+  x.tensors = buffer->tensors();
+  x(result...);
+  return des.buf;
+}
 
 }

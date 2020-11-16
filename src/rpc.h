@@ -8,6 +8,7 @@
 #include "synchronization.h"
 #include "async.h"
 #include "function.h"
+#include "buffer.h"
 
 #include <cstddef>
 #include <string_view>
@@ -20,144 +21,6 @@
 #include <mutex>
 
 namespace rpc {
-
-struct Buffer {
-  Buffer* next{nullptr};
-  size_t capacity = 0;
-  size_t size = 0;
-  std::atomic_int refcount{0};
-  std::byte* data() {
-    return dataptr<std::byte>(this);
-  }
-};
-
-struct BufferHandle {
-  Buffer* buffer_ = nullptr;
-  BufferHandle() = default;
-  BufferHandle(Buffer* buffer) noexcept : buffer_(buffer) {}
-  BufferHandle(const BufferHandle&) = delete;
-  BufferHandle& operator=(const BufferHandle&) = delete;
-  BufferHandle(BufferHandle&& n) noexcept {
-    buffer_ = n.buffer_;
-    n.buffer_ = nullptr;
-  }
-  BufferHandle& operator=(BufferHandle&& n) noexcept {
-    std::swap(buffer_, n.buffer_);
-    return *this;
-  }
-  ~BufferHandle() {
-    if (buffer_) {
-      //printf("non shared deallocate\n");
-      deallocate<Buffer, std::byte>(buffer_);
-    }
-  }
-  explicit operator bool() const noexcept {
-    return buffer_;
-  }
-  Buffer* operator->() const noexcept {
-    return buffer_;
-  }
-  operator Buffer*() const noexcept {
-    return buffer_;
-  }
-  Buffer* release() noexcept {
-    Buffer* r = buffer_;
-    buffer_ = nullptr;
-    return r;
-  }
-};
-struct SharedBufferHandle {
-  Buffer* buffer_ = nullptr;
-  SharedBufferHandle() = default;
-  SharedBufferHandle(Buffer* buffer) noexcept : buffer_(buffer) {
-    if (buffer_) {
-      if (buffer->refcount != 0) std::abort();
-      addref();
-    }
-  }
-  SharedBufferHandle(const SharedBufferHandle& n) noexcept {
-    buffer_ = n.buffer_;
-    if (buffer_) {
-      addref();
-    }
-  }
-  SharedBufferHandle& operator=(const SharedBufferHandle& n) noexcept {
-    buffer_ = n.buffer_;
-    if (buffer_) {
-      addref();
-    }
-    return *this;
-  }
-  SharedBufferHandle(SharedBufferHandle&& n) noexcept {
-    buffer_ = n.buffer_;
-    n.buffer_ = nullptr;
-  }
-  SharedBufferHandle& operator=(SharedBufferHandle&& n) noexcept {
-    std::swap(buffer_, n.buffer_);
-    return *this;
-  }
-  ~SharedBufferHandle() {
-    if (buffer_ && decref() == 0) {
-      //printf("shared deallocate\n");
-      deallocate<Buffer, std::byte>(buffer_);
-    }
-  }
-  explicit operator bool() const noexcept {
-    return buffer_;
-  }
-  Buffer* operator->() const noexcept {
-    return buffer_;
-  }
-  operator Buffer*() const noexcept {
-    return buffer_;
-  }
-  int addref() noexcept {
-    return buffer_->refcount.fetch_add(1, std::memory_order_acquire) + 1;
-  }
-  int decref() noexcept {
-    int r = buffer_->refcount.fetch_sub(1, std::memory_order_release) - 1;
-    //printf("decref %p %d\n", this, r);
-    return r;
-    return buffer_->refcount.fetch_sub(1, std::memory_order_release) - 1;
-  }
-};
-
-template<typename... T>
-void serializeToBuffer(BufferHandle& buffer, const T&... v) {
-  Serialize<OpSize> x{nullptr};
-  (x(v), ...);
-  size_t size = x.dst - (std::byte*)nullptr;
-  if (!buffer || buffer->capacity < size) {
-    buffer = BufferHandle(rpc::allocate<Buffer, std::byte>(size));
-  }
-  buffer->size = size;
-  std::byte* dst = dataptr<std::byte>(&*buffer);
-  Serialize<OpWrite> x2{dst};
-  (x2(v), ...);
-}
-
-template<typename... T>
-BufferHandle serializeToBuffer(const T&... v) {
-  BufferHandle h;
-  serializeToBuffer(h, std::forward<const T&>(v)...);
-  return h;
-}
-
-template<typename... T>
-void deserializeBuffer(const void* ptr, size_t len, T&... result) {
-  Deserializer des(std::string_view{(const char*)ptr, len});
-  Deserialize x(des);
-  x(result...);
-}
-template<typename... T>
-void deserializeBuffer(const Buffer* buffer, T&... result) {
-  const std::byte* data = dataptr<std::byte>(buffer);
-  return deserializeBuffer(data, buffer->size, result...);
-}
-template<typename... T>
-void deserializeBuffer(const BufferHandle& buffer, T&... result) {
-  return deserializeBuffer(&*buffer, result...);
-}
 
 struct Error: std::exception {
   std::string str;
@@ -290,7 +153,7 @@ struct Rpc {
   template<typename R, typename Callback, typename... Args>
   void asyncCallback(std::string_view peerName, std::string_view functionName, Callback&& callback, const Args&... args) {
     BufferHandle buffer;
-    serializeToBuffer(buffer, (uint32_t)0, (uint32_t)0, args...);
+    serializeToBuffer(buffer, (uint32_t)0, (uint32_t)0, (uint32_t)0, args...);
     //printf("original buffer size is %d\n", buffer->size);
 
     sendRequest(peerName, functionName, std::move(buffer), [callback = std::forward<Callback>(callback)](const void* ptr, size_t len, Error* error) noexcept {
