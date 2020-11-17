@@ -4,97 +4,114 @@
 
 #include <cstddef>
 #include <cstdlib>
-#include <mutex>
+#include <array>
 
 namespace rpc {
 
 namespace allocimpl {
 
-template<typename Header, typename Data>
+template<typename Header, typename Data, size_t Size>
 struct Storage {
+  static constexpr size_t size = Size;
   Header* freelist = nullptr;
+  size_t freelistSize = 0;
 
-  Header* allocate(size_t n) {
-    //printf("allocate %p %s %d\n", this, typeid(*this).name(), n);
-    static_assert(alignof(Header) >= alignof(Data));
-    Header* h = (Header*)std::aligned_alloc(64, sizeof(Header) + sizeof(Data) * n);
-    new (h) Header();
-    h->capacity = n;
-    return h;
+  ~Storage() {
+    for (Header* ptr = freelist; ptr;) {
+      Header* next = ptr->next;
+      std::free(ptr);
+      ptr = next;
+    }
+  }
+
+  Header* allocate() {
+    static_assert(alignof(Header) <= 64 && alignof(Data) <= 64 && alignof(Data) <= sizeof(Header));
     Header* r = freelist;
     if (!r) {
-      r = (Header*)std::aligned_alloc(64, sizeof(Header) + sizeof(Data) * n);
+      r = (Header*)std::aligned_alloc(64, size);
       new (r) Header();
+      r->capacity = size - sizeof(Header);
     } else {
+      --freelistSize;
       freelist = r->next;
-      if (r->capacity < n) {
-        if (r->refcount != 0) {
-          std::abort();
-        }
-        r->~Header();
-        std::free(r);
-        r = (Header*)std::aligned_alloc(64, sizeof(Header) + sizeof(Data) * n);
-        new (r) Header();
+      if (r->capacity != size - sizeof(Header)) {
+        std::abort();
+      }
+      if (r->refcount != 0) {
+        std::abort();
       }
     }
-    //printf("allocate %p refcount %d\n", r, (int)r->refcount);
     if (r->refcount != 0) {
       std::abort();
     }
     return r;
   }
   void deallocate(Header* ptr) {
-    //printf("deallocate %p refcount %d\n", ptr, (int)ptr->refcount);
     if (ptr->refcount != 0) {
       std::abort();
     }
-    std::free(ptr);
-    return;
+    if (freelistSize >= 1024 * 1024 / Size) {
+      std::free(ptr);
+      return;
+    }
+    ++freelistSize;
     ptr->next = freelist;
     freelist = ptr;
   }
-//  std::atomic<Header*> freelist = nullptr;
 
-//  Header* allocate(size_t n) {
-//    //printf("allocate %p %s\n", this, typeid(*this).name());
-//    static_assert(alignof(Header) >= alignof(Data));
-////    Header* h = (Header*)std::malloc(sizeof(Header) + sizeof(Data) * n);
-////    h->capacity = n;
-////    return h;
-//    Header* r = freelist.load(std::memory_order_relaxed);
-//    while (r && !freelist.compare_exchange_weak(r, r->next, std::memory_order_relaxed));
-//    if (!r) {
-//      r = (Header*)std::malloc(sizeof(Header) + sizeof(Data) * n);
-//      r->capacity = n;
-//    } else if (r->capacity < n) {
-//      std::free(r);
-//      r = (Header*)std::malloc(sizeof(Header) + sizeof(Data) * n);
-//      r->capacity = n;
-//    }
-//    return r;
-//  }
-//  void deallocate(Header* ptr) {
-////    std::free(ptr);
-////    return;
-//    Header* next = freelist.load(std::memory_order_relaxed);
-//    do {
-//      ptr->next = next;
-//    } while (!freelist.compare_exchange_weak(next, ptr, std::memory_order_relaxed));
-//  }
 };
 
 template<typename Header, typename Data>
-inline thread_local Storage<Header, Data> storage;
+inline thread_local Storage<Header, Data, 64> storage_64;
+template<typename Header, typename Data>
+inline thread_local Storage<Header, Data, 256> storage_256;
+template<typename Header, typename Data>
+inline thread_local Storage<Header, Data, 1024> storage_1024;
+template<typename Header, typename Data>
+inline thread_local Storage<Header, Data, 4096> storage_4096;
 
 }
 
 template<typename Header, typename Data>
 Header* allocate(size_t n) {
-  return allocimpl::storage<Header, Data>.allocate(n);
+  constexpr size_t overhead = sizeof(Header);
+  if (n + overhead <= 64) {
+    return allocimpl::storage_64<Header, Data>.allocate();
+  } else if (n + overhead <= 256) {
+    return allocimpl::storage_256<Header, Data>.allocate();
+  } else if (n + overhead <= 1024) {
+    return allocimpl::storage_1024<Header, Data>.allocate();
+  } else if (n + overhead <= 4096) {
+    return allocimpl::storage_4096<Header, Data>.allocate();
+  } else {
+    Header* h = (Header*)std::aligned_alloc(64, sizeof(Header) + sizeof(Data) * n);
+    new (h) Header();
+    h->capacity = n;
+    return h;
+  }
 }
 template<typename Header, typename Data>
 void deallocate(Header* ptr) {
-  return allocimpl::storage<Header, Data>.deallocate(ptr);
+  const size_t n = ptr->capacity + sizeof(Header);
+  switch (n) {
+  case 64:
+    allocimpl::storage_64<Header, Data>.deallocate(ptr);
+    break;
+  case 256:
+    allocimpl::storage_256<Header, Data>.deallocate(ptr);
+    break;
+  case 1024:
+    allocimpl::storage_1024<Header, Data>.deallocate(ptr);
+    break;
+  case 4096:
+    allocimpl::storage_4096<Header, Data>.deallocate(ptr);
+    break;
+  default:
+    if (n <= 4096 || ptr->refcount != 0) {
+      std::abort();
+    }
+    std::free(ptr);
+  }
 }
 template<typename Data, typename Header>
 Data* dataptr(Header* ptr) {

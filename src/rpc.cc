@@ -2079,14 +2079,14 @@ struct RpcImpl : RpcImplBase {
     rpc.onGreeting(conn, peerName, peerId, std::move(info));
   }
 
-  void addLatency(PeerImpl& peer, std::chrono::steady_clock::time_point now, std::chrono::steady_clock::duration duration) {
+  void addLatency(PeerImpl& peer, std::chrono::steady_clock::time_point now, std::chrono::steady_clock::duration duration, int partIndex = -1) {
     uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
 
     //float latency = std::min(us, (uint64_t)1000) / 100.0f + std::min(us / 1000.0f, 1000.0f);
     float latency = std::min(us / 1000.0f, 10000.0f);
 
     if (latency >= 500) {
-      log("WARNING: connection %s us is %lld, latency is %g\n", connectionTypeName[index<API>], us, latency);
+      log("WARNING: connection %s part %d us is %lld, latency is %g\n", connectionTypeName[index<API>], partIndex, us, latency);
       //std::abort();
     }
 
@@ -2417,12 +2417,12 @@ struct RpcImpl : RpcImplBase {
             SharedBufferHandle shared(outbuffer.release());
             log("sending response for rid %#x of %d bytes to %s\n", rid, shared->size, peer->name);
             //conn->send(shared);
-            peer->banditSend(~0, shared);
 
             auto now = std::chrono::steady_clock::now();
             Rpc::Impl::IncomingBucket& bucket = rpc.getBucket(rpc.incoming_, rid);
             std::lock_guard l2(rpc.incomingFifoMutex_);
             std::unique_lock l(bucket.mutex);
+            peer->banditSend(~0, shared);
             size_t totalResponseSize;
             auto i = bucket.map.find(rid);
             if (i != bucket.map.end()) {
@@ -2489,7 +2489,7 @@ struct RpcImpl : RpcImplBase {
           }
           s.acked = true;
           s.ackTimestamp = now;
-          addLatency(peer, now, now - s.lastSendTimestamp);
+          addLatency(peer, now, now - s.lastSendTimestamp, partIndex);
         }
         if (hasResponse && !x.serverHasResponse) {
           x.serverHasResponse = true;

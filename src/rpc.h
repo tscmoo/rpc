@@ -74,7 +74,7 @@ struct Rpc {
     virtual void call(BufferHandle, Function<void(BufferHandle)>) = 0;
   };
 
-  template <typename F>
+  template <typename Signature, typename F>
   struct FImpl;
 
   enum ReqType : uint32_t {
@@ -96,11 +96,12 @@ struct Rpc {
 
   async::SchedulerFifo scheduler;
 
-  template <typename R, typename... Args>
-  struct FImpl<R(Args...)> : FBase {
+  template <typename R, typename... Args, typename F>
+  struct FImpl<R(Args...), F> : FBase {
     Rpc& rpc;
-    Function<R(Args...)> f;
-    FImpl(Rpc& rpc, Function<R(Args...)>&& f) : rpc(rpc), f(std::move(f)) {
+    F f;
+    template<typename F2>
+    FImpl(Rpc& rpc, F2&& f) : rpc(rpc), f(std::forward<F2>(f)) {
     }
     virtual ~FImpl() {}
     virtual void call(BufferHandle inbuffer, Function<void(BufferHandle)> callback) noexcept override {
@@ -145,9 +146,9 @@ struct Rpc {
     }
   };
 
-  template<typename F>
-  void define(std::string_view name, Function<F>&& f) {
-    auto ff = std::make_unique<FImpl<F>>(*this, std::move(f));
+  template<typename Signature, typename F>
+  void define(std::string_view name, F&& f) {
+    auto ff = std::make_unique<FImpl<Signature, F>>(*this, std::forward<F>(f));
     define(name, std::move(ff));
   }
 

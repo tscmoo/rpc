@@ -20,7 +20,7 @@ struct Buffer {
   size_t capacity = 0;
   size_t size = 0;
   size_t nTensors = 0;
-  std::atomic_int refcount{0};
+  std::atomic_int refcount = 0;
   std::byte* data() {
     return dataptr<std::byte>(this);
   }
