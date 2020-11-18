@@ -699,7 +699,7 @@ struct Me {
   T* me = nullptr;
   Me() = default;
   Me(std::nullptr_t) noexcept {}
-  Me(T* me) noexcept : me(me) {
+  explicit Me(T* me) noexcept : me(me) {
     if (me) {
       me->activeOps.fetch_add(1, std::memory_order_relaxed);
     }
@@ -885,7 +885,7 @@ struct PeerImpl {
       } else {
         ((RpcConnectionImpl<API>&)*c).send(std::move(buffer));
         if (outConnection) {
-          *outConnection = &*c;
+          *outConnection = makeMe(&*c);
         }
         return true;
       }
@@ -1060,7 +1060,7 @@ struct RpcConnectionImpl : RpcConnectionImplBase {
   }
 
   void start() {
-    read(this);
+    read(makeMe(this));
   }
 
   template<typename Buffer>
@@ -1158,24 +1158,46 @@ struct Rpc::Impl {
   uint32_t baseFuncId_ = random<uint32_t>(Rpc::reqCallOffset, std::numeric_limits<uint32_t>::max() - maxFunctions_);
   uint32_t nextFuncIndex_ = 0;
 
+  struct Resend {
+    SharedBufferHandle buffer;
+    std::chrono::steady_clock::time_point ackTimestamp;
+    std::chrono::steady_clock::time_point pokeTimestamp;
+    std::chrono::steady_clock::time_point lastSendTimestamp;
+    std::chrono::steady_clock::time_point lastSendFailTimestamp;
+    size_t connectionIndex = ~0;
+    Me<RpcConnectionImplBase> connection = nullptr;
+    int pokeCount = 0;
+    bool acked = false;
+    int nackCount = 0;
+  };
+
+  struct TensorData {
+    BufferHandle buffer;
+    size_t offset;
+    std::string_view data;
+  };
+
+  struct Receive {
+    BufferHandle buffer;
+    std::vector<TensorData> tensorData;
+    uint32_t receivedTensors = 0;
+    bool done = false;
+  };
+
   struct Incoming {
     Incoming* prev = nullptr;
     Incoming* next = nullptr;
     uint32_t rid;
     std::chrono::steady_clock::time_point responseTimestamp;
-    SharedBufferHandle responseBuffer;
     PeerImpl* peer = nullptr;
-    bool called = false;
 
-    struct TensorData {
-      BufferHandle buffer;
-      size_t offset;
-      std::string_view data;
-    };
+    int timeoutCount = 0;
+    std::chrono::steady_clock::time_point timeout;
+    Receive recv;
 
-    BufferHandle requestBuffer;
-    std::vector<TensorData> tensorData;
-    uint32_t receivedTensors = 0;
+    Resend resend;
+    std::vector<Resend> resendTensors;
+    size_t partsAcked = 0;
   };
 
   struct IncomingBucket {
@@ -1194,35 +1216,30 @@ struct Rpc::Impl {
   std::atomic<std::chrono::steady_clock::time_point> timeout_ = std::chrono::steady_clock::now();
   std::atomic<bool> timeoutDead_ = false;
 
-  struct Resend {
-    SharedBufferHandle buffer;
-    std::chrono::steady_clock::time_point ackTimestamp;
-    std::chrono::steady_clock::time_point pokeTimestamp;
-    std::chrono::steady_clock::time_point lastSendTimestamp;
-    std::chrono::steady_clock::time_point lastSendFailTimestamp;
-    size_t connectionIndex = ~0;
-    Me<RpcConnectionImplBase> connection = nullptr;
-    int pokeCount = 0;
-    bool acked = false;
-  };
-
-  struct OutgoingTensor {
-    Resend resend;
-  };
-
   struct Outgoing {
     Outgoing* prev = nullptr;
     Outgoing* next = nullptr;
     std::chrono::steady_clock::time_point requestTimestamp;
     std::chrono::steady_clock::time_point timeout;
     uint32_t rid = 0;
-    bool serverHasResponse = false;
-    std::chrono::steady_clock::time_point serverHasResponseTimestamp;
     Rpc::ResponseCallback response;
     PeerImpl* peer = nullptr;
     int timeoutCount = 0;
-    std::vector<OutgoingTensor> tensors;
+    std::vector<Resend> resendTensors;
     Resend resend;
+    size_t partsAcked = 0;
+
+    Receive recv;
+
+//    struct ResponseTensor {
+//      BufferHandle buffer;
+//      std::chrono::steady_clock::time_point lastPoke;
+//      size_t pokeConnectionIndex = ~0;
+//      Me<RpcConnectionImplBase> pokeConnection = nullptr;
+//    };
+
+//    BufferHandle responseBuffer;
+//    std::vector<ResponseTensor> responseTensors;
   };
 
   struct OutgoingBucket {
@@ -1297,7 +1314,8 @@ struct Rpc::Impl {
     return arr[(rid >> 1) % arr.size()];
   }
 
-  std::chrono::steady_clock::time_point processTimeout(Outgoing& o, std::chrono::steady_clock::time_point now, Resend& s, uint32_t partIndex) {
+  template<typename T>
+  std::chrono::steady_clock::time_point processTimeout(T& o, std::chrono::steady_clock::time_point now, Resend& s, uint32_t partIndex) {
     auto newTimeout = now + std::chrono::seconds(1);
     if (partIndex && s.acked) {
       return newTimeout;
@@ -1310,6 +1328,7 @@ struct Rpc::Impl {
         for (size_t i = 0; i != x.conns.size(); ++i) {
           if (&*x.conns[i] == &*s.connection) {
             o.peer->throwAway(x, i);
+            break;
           }
         }
         s.connection = nullptr;
@@ -1317,11 +1336,12 @@ struct Rpc::Impl {
     }
     if (!s.connection) {
       s.pokeCount = 0;
+      s.acked = false;
     }
     if (s.pokeCount < 2) {
-      //log("timeout sending poke for rid %#x (destined for %s)\n", o.rid, o.peer->name);
+      log("timeout sending poke for rid %#x part %d (destined for %s)\n", o.rid, partIndex, o.peer->name);
       BufferHandle buffer;
-      serializeToBuffer(buffer, o.rid, Rpc::reqPoke, s.acked && o.serverHasResponse && now - o.serverHasResponseTimestamp >= std::chrono::seconds(2), partIndex);
+      serializeToBuffer(buffer, o.rid, Rpc::reqPoke, partIndex);
       size_t index;
       bool b = o.peer->banditSend(~0, std::move(buffer), &index);
       //log("timeout bandit send result: %d\n", b);
@@ -1332,6 +1352,7 @@ struct Rpc::Impl {
         ++s.pokeCount;
 
         newTimeout = now + std::chrono::milliseconds((int)std::ceil(o.peer->connections_.at(index).runningLatency.load(std::memory_order_relaxed) * (4 * o.timeoutCount)));
+        newTimeout = std::max(newTimeout, now + std::chrono::milliseconds(s.acked ? 1000 : 100));
         newTimeout = std::min(newTimeout, now + std::chrono::seconds(2));
       } else {
         newTimeout = now + std::chrono::milliseconds(250);
@@ -1340,14 +1361,15 @@ struct Rpc::Impl {
     return newTimeout;
   }
 
-  void processTimeout(std::chrono::steady_clock::time_point now, Outgoing& o) {
+  template<typename T>
+  void processTimeout(std::chrono::steady_clock::time_point now, T& o) {
     ++o.timeoutCount;
     auto newTimeout = now + std::chrono::seconds(1);
     //log("process timeout!\n");
     if (o.peer) {
       newTimeout = std::min(newTimeout, processTimeout(o, now, o.resend, 0));
-      for (size_t i = 0; i != o.tensors.size(); ++i) {
-        newTimeout = std::min(newTimeout, processTimeout(o, now, o.tensors[i].resend, 1 + i));
+      for (size_t i = 0; i != o.resendTensors.size(); ++i) {
+        newTimeout = std::min(newTimeout, processTimeout(o, now, o.resendTensors[i], 1 + i));
       }
     }
     o.timeout = newTimeout;
@@ -1401,10 +1423,23 @@ struct Rpc::Impl {
       for (auto& b : outgoing_) {
         std::lock_guard l(b.mutex);
         for (auto& v : b.map) {
-          if (now >= v.second.timeout) {
-            processTimeout(now, v.second);
+          if (v.second.resend.buffer) {
+            if (now >= v.second.timeout) {
+              processTimeout(now, v.second);
+            }
+            newTimeout = std::min(newTimeout, v.second.timeout);
           }
-          newTimeout = std::min(newTimeout, v.second.timeout);
+        }
+      }
+      for (auto& b : incoming_) {
+        std::lock_guard l(b.mutex);
+        for (auto& v : b.map) {
+          if (v.second.resend.buffer) {
+            if (now >= v.second.timeout) {
+              processTimeout(now, v.second);
+            }
+            newTimeout = std::min(newTimeout, v.second.timeout);
+          }
         }
       }
       timeout = timeout_.load(std::memory_order_relaxed);
@@ -1571,7 +1606,7 @@ struct Rpc::Impl {
     return (RpcImpl<API>*)&*rpcs_.at(index<API>);
   }
 
-  size_t computeStorageNbytes(
+  static size_t computeStorageNbytes(
       torch::IntArrayRef sizes,
       torch::IntArrayRef strides,
       size_t itemsize_bytes) {
@@ -1590,7 +1625,7 @@ struct Rpc::Impl {
   bool resend(PeerImpl& peer, Resend& s) {
     size_t index;
     Me<RpcConnectionImplBase> connection;
-    if (peer.banditSend(~0, std::move(s.buffer), &index, &connection)) {
+    if (peer.banditSend(~0, s.buffer, &index, &connection)) {
       s.lastSendTimestamp = std::chrono::steady_clock::now();
       s.connection = std::move(connection);
       s.connectionIndex = index;
@@ -1636,7 +1671,6 @@ struct Rpc::Impl {
       }
     }
     auto now = std::chrono::steady_clock::now();
-    auto myTimeout = now + std::chrono::seconds(1);
     {
       //log("send request %#x %#x\n", rid, fid);
 //      if (conn.dead.load(std::memory_order_relaxed)) {
@@ -1677,24 +1711,23 @@ struct Rpc::Impl {
 
       if (nTensors) {
         for (uint32_t i = 0; i != nTensors; ++i) {
-          q.tensors.emplace_back();
-          auto& qt = q.tensors.back();
-          qt.resend.buffer = std::move(tensorbuffers[i]);
-          resend(peer, qt.resend);
+          q.resendTensors.emplace_back();
+          q.resendTensors.back().buffer = std::move(tensorbuffers[i]);
+          resend(peer, q.resendTensors.back());
         }
       }
     }
-    //log("myTimeout is in %d\n", std::chrono::duration_cast<std::chrono::milliseconds>(myTimeout - now).count());
+    updateTimeout(now + std::chrono::seconds(1));
+  }
+
+  void updateTimeout(std::chrono::steady_clock::time_point myTimeout) {
     static_assert(std::atomic<std::chrono::steady_clock::time_point>::is_always_lock_free);
     auto timeout = timeout_.load(std::memory_order_acquire);
     while (myTimeout < timeout) {
       if (timeout_.compare_exchange_weak(timeout, myTimeout)) {
-        //log("timeout set to %d\n", std::chrono::duration_cast<std::chrono::milliseconds>(timeout_.load() - now).count());
-        //log("waking up %p\n", this);
         timeoutSem_.post();
       }
     }
-    //log("timeout post is in %d\n", std::chrono::duration_cast<std::chrono::milliseconds>(timeout_.load() - now).count());
     std::call_once(timeoutThreadOnce_, [&]() {
       startTimeoutThread();
     });
@@ -1718,17 +1751,18 @@ struct Rpc::Impl {
       functionName = persistentString(functionName);
       BufferHandle buffer2;
       serializeToBuffer(buffer2, (uint32_t)0, (uint32_t)0, functionName);
-      sendRequest(peer, reqFindFunction, std::move(buffer2), [this, peer = &peer, functionName = functionName, buffer = std::move(buffer), response = std::move(response)](const void* ptr, size_t len, Error* error) mutable noexcept {
+      sendRequest(peer, reqFindFunction, std::move(buffer2), [this, peer = &peer, functionName = functionName, buffer = std::move(buffer), response = std::move(response)](BufferHandle recvbuffer, Error* error) mutable noexcept {
         if (error) {
-          std::move(response)(nullptr, 0, error);
+          std::move(response)(nullptr, error);
         } else {
+          log("got %d bytes\n", recvbuffer->size);
           RemoteFunction rf;
-          deserializeBuffer(ptr, len, rf);
+          deserializeBuffer(recvbuffer, rf);
           uint32_t fid = rf.id;
           //log("got id %#x\n", id);
           if (fid == 0) {
             Error err("RPC remote function " + std::string(peer->name) + "::'" + std::string(functionName) + "' does not exist");
-            std::move(response)(nullptr, 0, &err);
+            std::move(response)(nullptr, &err);
             return;
           }
           rf.typeId = persistentString(rf.typeId);
@@ -1935,12 +1969,12 @@ struct Rpc::Impl {
             log("poking on newly established connection\n");
             BufferHandle buffer;
             serializeToBuffer(buffer, o.rid, Rpc::reqPoke, o.resend.acked, (uint32_t)0);
-            peer.banditSend(1 << index<API>, std::move(buffer));
-            for (size_t i = 0; i != o.tensors.size(); ++i) {
-              auto& t = o.tensors[i];
-              if (!t.resend.connection) {
+            conn.send(std::move(buffer));
+            for (size_t i = 0; i != o.resendTensors.size(); ++i) {
+              auto& t = o.resendTensors[i];
+              if (!t.connection) {
                 serializeToBuffer(buffer, o.rid, Rpc::reqPoke, o.resend.acked, uint32_t(1 + i));
-                peer.banditSend(1 << index<API>, std::move(buffer));
+                conn.send(std::move(buffer));
               }
             }
           }
@@ -2123,10 +2157,280 @@ struct RpcImpl : RpcImplBase {
     }
   }
 
+  template<typename T>
+  void handlePoke(T& container, PeerImpl& peer, RpcConnectionImpl<API>& conn, uint32_t rid, const std::byte* ptr, size_t len) {
+    uint32_t partIndex;
+    deserializeBuffer(ptr, len, partIndex);
+    auto& bucket = rpc.getBucket(container, rid);
+    std::unique_lock l(bucket.mutex);
+    auto i = bucket.map.find(rid);
+    if (i == bucket.map.end()) {
+      log("got poke for unknown rid, nack %d\n", partIndex);
+      BufferHandle buffer;
+      //serializeToBuffer(buffer, rid, Rpc::reqNotFound);
+      serializeToBuffer(buffer, rid, Rpc::reqNack, partIndex);
+      conn.send(std::move(buffer));
+    } else {
+      auto& x = i->second;
+      if (x.rid != rid) {
+        log("rid %#x is not set!\n", rid);
+        std::abort();
+      }
+      if (x.peer != &peer) {
+        log("peer %p vs %p\n", (void*)x.peer, (void*)&peer);
+        log("rid collision on poke! (not fatal!)\n");
+        std::terminate();
+      }
+      bool ack = false;
+      if (x.recv.done) {
+        ack = true;
+      } else {
+        if (partIndex == 0) {
+          ack = x.recv.buffer != nullptr;
+        } else {
+          size_t tensorIndex = partIndex - 1;
+          if (tensorIndex < x.recv.tensorData.size()) {
+            ack = x.recv.tensorData[tensorIndex].buffer != nullptr;
+          }
+        }
+        l.unlock();
+        log("got poke %s %d\n", ack ? "ack" : "nack", partIndex);
+        BufferHandle buffer;
+        serializeToBuffer(buffer, rid, ack ? Rpc::reqAck : Rpc::reqNack, partIndex);
+        conn.send(std::move(buffer));
+      }
+    }
+  }
+
+  template<bool allowNew, typename T>
+  BufferHandle handleRecv(T& container, PeerImpl& peer, RpcConnectionImpl<API>& conn, uint32_t rid,  const std::byte* ptr, size_t len) {
+    uint32_t nTensors;
+    auto view = deserializeBuffer(ptr, len, nTensors);
+    ptr = (const std::byte*)view.data();
+    len = view.size();
+    bool isTensor = nTensors == (uint32_t)~0;
+    if (isTensor) {
+      nTensors = 0;
+    }
+    auto find = [&](auto& bucket, auto& l) {
+      auto check = [&](auto i) -> decltype(&i->second) {
+        if (i == bucket.map.end()) {
+          return nullptr;
+        }
+        auto& x = i->second;
+        if (x.rid != rid) {
+          log("rid %#x is not set!\n", rid);
+          std::abort();
+        }
+        if (x.peer != &peer) {
+          log("peer %p vs %p\n", (void*)x.peer, (void*)&peer);
+          log("rid collision on recv! (not fatal!)\n");
+          // but we probably need a rid collision message so that the client can change rid
+          //   -- what? the client can't change rid ...
+          std::terminate();
+        }
+        if (x.recv.done) {
+          l.unlock();
+          log("recv for rid %#x already done\n", rid);
+          BufferHandle buffer;
+          serializeToBuffer(buffer, rid, Rpc::reqAck, (uint32_t)0);
+          conn.send(std::move(buffer));
+          return nullptr;
+        }
+        return &x;
+      };
+      if constexpr (allowNew) {
+        auto i = bucket.map.try_emplace(rid);
+        auto& x = i.first->second;
+        if (i.second) {
+          x.peer = &peer;
+          x.rid = rid;
+        }
+        return check(i.first);
+      } else {
+        return check(bucket.map.find(rid));
+      }
+    };
+    //log("call with len %d\n", len);
+    auto createTensors = [&](auto& x, auto& l) {
+      auto data = std::move(x.recv.tensorData);
+      BufferHandle buffer = std::move(x.recv.buffer);
+      l.unlock();
+      for (size_t i = 0; i != data.size(); ++i) {
+        auto& d = data[i];
+        Deserializer des(std::string_view((const char*)buffer->data(), buffer->size));
+        Deserialize xd(des);
+        des.consume(d.offset - 12);
+        buffer->tensors()[i].tensor = serializeHelperAllocateTensor(xd, (std::byte*)d.data.data(), d.data.size(), std::move(d.buffer));
+      }
+      return buffer;
+    };
+    BufferHandle inbuffer = makeBuffer(len, nTensors);
+    std::memcpy(inbuffer->data(), ptr, len);
+    inbuffer->size = len;
+    if (!isTensor) {
+      BufferHandle buffer;
+      serializeToBuffer(buffer, rid, Rpc::reqAck, (uint32_t)0);
+      conn.send(std::move(buffer));
+      auto& bucket = rpc.getBucket(container, rid);
+      std::unique_lock l(bucket.mutex);
+      auto xptr = find(bucket, l);
+      if (xptr) {
+        log("recv %d tensors\n", nTensors);
+        auto& x = *xptr;
+        if (nTensors) {
+          if (x.recv.done) {
+            log("already called !? main\n");
+            return nullptr;
+          }
+          x.recv.buffer = std::move(inbuffer);
+          x.recv.tensorData.resize(nTensors);
+          if (x.recv.receivedTensors >= nTensors) {
+            log("got all %d tensors, let's go bitches!\n", nTensors);
+            x.recv.done = true;
+            return createTensors(x, l);
+          }
+        } else {
+          x.recv.done = true;
+          return inbuffer;
+        }
+      }
+    } else {
+      uint32_t tensorIndex;
+      uint32_t offset;
+      std::string_view data;
+      deserializeBuffer(inbuffer, tensorIndex, offset, data);
+
+      BufferHandle buffer;
+      serializeToBuffer(buffer, rid, Rpc::reqAck, 1 + tensorIndex);
+      conn.send(std::move(buffer));
+
+      auto& bucket = rpc.getBucket(container, rid);
+      std::unique_lock l(bucket.mutex);
+      auto xptr = find(bucket, l);
+      if (xptr) {
+        auto& x = *xptr;
+        if (x.recv.done) {
+          log("already called !? tensor %d\n", tensorIndex);
+          return nullptr;
+        }
+        if (x.recv.tensorData.size() <= tensorIndex) {
+          if (x.recv.buffer) {
+            // If we received the main part of the request, then tensorData is resized
+            // to the exact number of tensors in the request.
+            log("received bad tensor\n");
+            std::abort();
+            return nullptr;
+          }
+          x.recv.tensorData.resize(std::max((size_t)tensorIndex + 16, x.recv.tensorData.size() + x.recv.tensorData.size() / 2));
+        } else {
+          if (x.recv.tensorData[tensorIndex].buffer) {
+            log("already has tensor data for this index!\n");
+            std::abort();
+            return nullptr;
+          }
+        }
+        x.recv.tensorData[tensorIndex] = {std::move(inbuffer), offset, data};
+        ++x.recv.receivedTensors;
+        if (x.recv.buffer && (size_t)x.recv.receivedTensors >= x.recv.tensorData.size()) {
+          log("do call yo got the last tensor\n");
+          x.recv.done = true;
+          return createTensors(x, l);
+        }
+      }
+    }
+    return nullptr;
+  }
+
+  template<bool isIncoming, typename T>
+  void handleAck(T& container, PeerImpl& peer, RpcConnectionImpl<API>& conn, uint32_t rid, const std::byte* ptr, size_t len) {
+    uint32_t partIndex;
+    deserializeBuffer(ptr, len, partIndex);
+    auto& bucket = rpc.getBucket(container, rid);
+    std::optional<std::chrono::steady_clock::duration> duration;
+    {
+      std::unique_lock l2(rpc.incomingFifoMutex_, std::defer_lock);
+      if constexpr (isIncoming) {
+        l2.lock();
+      }
+      std::lock_guard l(bucket.mutex);
+      auto i = bucket.map.find(rid);
+      if (i != bucket.map.end()) {
+        auto& x = i->second;
+
+        auto now = std::chrono::steady_clock::now();
+        if (partIndex && partIndex - 1 >= x.resendTensors.size()) {
+          return;
+        }
+        auto& s = partIndex == 0 ? x.resend : x.resendTensors[partIndex - 1];
+        if (!s.acked) {
+          log("handleAck got ack for part %d\n", partIndex);
+          s.nackCount = 0;
+          s.acked = true;
+          s.ackTimestamp = now;
+          duration = now - s.lastSendTimestamp;
+          ++x.partsAcked;
+        }
+
+        if (x.partsAcked == 1 + x.resendTensors.size()) {
+          if constexpr (isIncoming) {
+            if (x.resend.buffer) {
+              rpc.totalResponseSize_.fetch_sub(x.resend.buffer->size, std::memory_order_relaxed);
+            }
+            for (auto& v : x.resendTensors) {
+              if (v.buffer) {
+                rpc.totalResponseSize_.fetch_sub(v.buffer->size, std::memory_order_relaxed);
+              }
+            }
+            listErase(&x);
+            log("%#x acked and freed\n", rid);
+            bucket.map.erase(i);
+          }
+        }
+      }
+    }
+    if (duration) {
+      addLatency(peer, std::chrono::steady_clock::now(), *duration, partIndex);
+    }
+  }
+
+  template<typename T>
+  void handleNack(T& container, PeerImpl& peer, RpcConnectionImpl<API>& conn, uint32_t rid, const std::byte* ptr, size_t len) {
+    uint32_t partIndex = 0;
+    deserializeBuffer(ptr, len, partIndex);
+    log("got nack %d\n", partIndex);
+    auto& bucket = rpc.getBucket(container, rid);
+    std::unique_lock l(bucket.mutex);
+    auto i = bucket.map.find(rid);
+    if (i != bucket.map.end() && i->second.peer != &peer) {
+      log("rid collision on nack! (not fatal error)\n");
+      std::terminate();
+    }
+    if (i != bucket.map.end() && i->second.peer == &peer) {
+      auto& x = i->second;
+      if (partIndex && partIndex - 1 >= x.resendTensors.size()) {
+        return;
+      }
+      auto& s = partIndex == 0 ? x.resend : x.resendTensors[partIndex - 1];
+      if (s.buffer) {
+        ++s.nackCount;
+        log("nackCount is now %d\n", s.nackCount);
+        if (s.nackCount >= 4) {
+          log("nack resend\n");
+          std::abort();
+          if (!s.connection) {
+            rpc.resend(peer, s);
+          }
+        }
+      }
+    }
+  }
+
   void onRequest(PeerImpl& peer, RpcConnectionImpl<API>& conn, uint32_t rid, uint32_t fid, const std::byte* ptr, size_t len) noexcept {
     //log("onRequest rid %#x fid %#x %p %d\n", rid, fid, ptr, len);
     rid &= ~(uint32_t)1;
-    if (fid == Rpc::reqFindFunction) {
+    switch (fid) {
+    case Rpc::reqFindFunction: {
       // Look up function id by name
       std::string_view name;
       deserializeBuffer(ptr, len, name);
@@ -2140,86 +2444,29 @@ struct RpcImpl : RpcImplBase {
         }
       }
       BufferHandle buffer;
-      serializeToBuffer(buffer, rid, Rpc::reqSuccess, rf);
+      serializeToBuffer(buffer, rid, Rpc::reqSuccess, (uint32_t)0, rf);
       conn.send(std::move(buffer));
-    } else if (fid == Rpc::reqAck) {
+      break;
+    }
+    case Rpc::reqAck: {
       // Peer acknowledged that it has received the response
       // (return value of an RPC call)
-      Rpc::Impl::IncomingBucket& bucket = rpc.getBucket(rpc.incoming_, rid);
-      std::optional<std::chrono::steady_clock::duration> duration;
-      {
-        std::lock_guard l2(rpc.incomingFifoMutex_);
-        std::lock_guard l(bucket.mutex);
-        auto i = bucket.map.find(rid);
-        if (i != bucket.map.end()) {
-          auto& x = i->second;
-          if (x.responseBuffer) {
-            //log("responsed acked, yey, freeing response buffer\n");
-            duration = std::chrono::steady_clock::now() - x.responseTimestamp;
-            rpc.totalResponseSize_.fetch_sub(x.responseBuffer->size, std::memory_order_relaxed);
-            listErase(&x);
-          }
-          //log("%#x acked and freed\n", rid);
-          bucket.map.erase(i);
-        }
-      }
-      if (duration) {
-        addLatency(peer, std::chrono::steady_clock::now(), *duration);
-      }
-    } else if (fid == Rpc::reqPoke) {
+      handleAck<true>(rpc.incoming_, peer, conn, rid, ptr, len);
+      break;
+    }
+    case Rpc::reqPoke: {
       // Peer is poking us to check the status of an RPC call
       //log("got poke for %#x\n", rid);
-      Rpc::Impl::IncomingBucket& bucket = rpc.getBucket(rpc.incoming_, rid);
-      std::unique_lock l(bucket.mutex);
-      auto i = bucket.map.find(rid);
-      if (i == bucket.map.end()) {
-        //log("got poke for unknown rid\n");
-        BufferHandle buffer;
-        serializeToBuffer(buffer, rid, Rpc::reqNotFound);
-        conn.send(std::move(buffer));
-      } else {
-        auto& x = i->second;
-        if (x.rid != rid) {
-          log("rid %#x is not set!\n", rid);
-          std::abort();
-        }
-        if (x.peer != &peer) {
-          log("peer %p vs %p\n", (void*)x.peer, (void*)&peer);
-          log("rid collision on rpc call! (not fatal!)\n");
-          std::terminate();
-        }
-        bool wantsResponse;
-        uint32_t partIndex;
-        deserializeBuffer(ptr, len, wantsResponse, partIndex);
-        bool hasResponse = x.responseBuffer != nullptr;
-        if (hasResponse && wantsResponse) {
-          SharedBufferHandle r = x.responseBuffer;
-          l.unlock();
-          log("poke re-sending response\n");
-          peer.banditSend(~0, std::move(r));
-        } else {
-          bool ack = false;
-          if (x.called) {
-            ack = true;
-          } else {
-            if (partIndex == 0) {
-              ack = x.requestBuffer != nullptr;
-            } else {
-              size_t tensorIndex = partIndex - 1;
-              if (tensorIndex < x.tensorData.size()) {
-                ack = x.tensorData[tensorIndex].buffer != nullptr;
-              }
-            }
-          }
-          l.unlock();
-          log("poke %s %d %d\n", ack ? "ack" : "nack", hasResponse, partIndex);
-          BufferHandle buffer;
-          serializeToBuffer(buffer, rid, ack ? Rpc::reqAck : Rpc::reqNack, hasResponse, partIndex);
-          conn.send(std::move(buffer));
-        }
-        return;
-      }
-    } else if (fid == Rpc::reqLookingForPeer) {
+      handlePoke(rpc.incoming_, peer, conn, rid, ptr, len);
+      break;
+    }
+    case Rpc::reqNack: {
+      // Peer nacked a poke for us; this means we may need to
+      // resend a rpc response
+      handleNack(rpc.incoming_, peer, conn, rid, ptr, len);
+      break;
+    }
+    case Rpc::reqLookingForPeer: {
       // Peer is looking for some other peer(s)
       std::vector<std::string_view> names;
       deserializeBuffer(ptr, len, names);
@@ -2261,16 +2508,13 @@ struct RpcImpl : RpcImplBase {
           conn.send(std::move(buffer));
         }
       }
-    } else if (fid >= (uint32_t)Rpc::reqCallOffset) {
-      // RPC call
-      uint32_t nTensors;
-      auto view = deserializeBuffer(ptr, len, nTensors);
-      ptr = (const std::byte*)view.data();
-      len = view.size();
-      bool isTensor = nTensors == (uint32_t)~0;
-      if (isTensor) {
-        nTensors = 0;
+      break;
+    }
+    default:
+      if (fid < (uint32_t)Rpc::reqCallOffset) {
+        return;
       }
+      // RPC call
       size_t index = fid - rpc.baseFuncId_;
       Rpc::FBase* f = nullptr;
       {
@@ -2280,140 +2524,37 @@ struct RpcImpl : RpcImplBase {
         }
       }
       if (!f) {
-        if (!isTensor) {
-          BufferHandle buffer;
-          serializeToBuffer(buffer, rid, Rpc::reqFunctionNotFound);
-          conn.send(std::move(buffer));
-        }
+        BufferHandle buffer;
+        serializeToBuffer(buffer, rid, Rpc::reqFunctionNotFound, (uint32_t)0);
+        conn.send(std::move(buffer));
       } else {
-        {
-          Rpc::Impl::IncomingBucket& bucket = rpc.getBucket(rpc.incoming_, rid);
-          std::unique_lock l(bucket.mutex);
-          auto i = bucket.map.try_emplace(rid);
-          auto& x = i.first->second;
-          if (i.second) {
-            x.peer = &peer;
-            x.rid = rid;
-            x.called = !isTensor && nTensors == 0;
-            //log("new RPC call with rid %#x from %s!\n", rid, peer.name);
-          } else {
-            if (x.rid != rid) {
-              log("rid %#x is not set!\n", rid);
-              std::abort();
-            }
-            if (x.peer != &peer) {
-              log("peer %p vs %p\n", (void*)x.peer, (void*)&peer);
-              log("rid collision on rpc call! (not fatal!)\n");
-              // but we probably need a rid collision message so that the client can change rid
-              std::terminate();
-            }
-            bool hasResponse = x.responseBuffer != nullptr;
-            if (x.called || hasResponse) {
-              l.unlock();
-              log("RPC call already %s, hasResponse is %d\n", x.called ? "called" : "known", hasResponse);
-              BufferHandle buffer;
-              serializeToBuffer(buffer, rid, Rpc::reqAck, hasResponse, (uint32_t)0);
-              conn.send(std::move(buffer));
-              return;
-            }
-          }
-        }
-        //log("call with len %d\n", len);
-        BufferHandle inbuffer = makeBuffer(len, nTensors);
-        std::memcpy(inbuffer->data(), ptr, len);
-        inbuffer->size = len;
-        bool doCall = false;
-        auto createTensors = [&](auto& x, auto& l) {
-          auto data = std::move(x.tensorData);
-          inbuffer = std::move(x.requestBuffer);
-          l.unlock();
-          for (size_t i = 0; i != data.size(); ++i) {
-            auto& d = data[i];
-            Deserializer des(std::string_view((const char*)inbuffer->data(), inbuffer->size));
-            Deserialize xd(des);
-            des.consume(d.offset - 12);
-            inbuffer->tensors()[i].tensor = serializeHelperAllocateTensor(xd, (std::byte*)d.data.data(), d.data.size(), std::move(d.buffer));
-          }
-        };
-        if (!isTensor) {
-          BufferHandle buffer;
-          serializeToBuffer(buffer, rid, Rpc::reqAck, false, (uint32_t)0);
-          conn.send(std::move(buffer));
-          if (nTensors) {
-            log("got request with %d tensors\n", nTensors);
-            Rpc::Impl::IncomingBucket& bucket = rpc.getBucket(rpc.incoming_, rid);
-            std::unique_lock l(bucket.mutex);
-            auto i = bucket.map.find(rid);
-            if (i != bucket.map.end()) {
-              auto& x = i->second;
-              if (x.called) {
-                log("already called !? main\n");
-                return;
-              }
-              x.requestBuffer = std::move(inbuffer);
-              x.tensorData.resize(nTensors);
-              if (x.receivedTensors >= nTensors) {
-                log("got all %d tensors, let's go bitches!\n", nTensors);
-                x.called = true;
-                doCall = true;
-                createTensors(x, l);
-              }
-            }
-          } else {
-            doCall = true;
-          }
-        } else {
-          uint32_t tensorIndex;
-          uint32_t offset;
-          std::string_view data;
-          deserializeBuffer(inbuffer, tensorIndex, offset, data);
-
-          BufferHandle buffer;
-          serializeToBuffer(buffer, rid, Rpc::reqAck, false, 1 + tensorIndex);
-          conn.send(std::move(buffer));
-
-          Rpc::Impl::IncomingBucket& bucket = rpc.getBucket(rpc.incoming_, rid);
-          std::unique_lock l(bucket.mutex);
-          auto i = bucket.map.find(rid);
-          if (i != bucket.map.end()) {
-            auto& x = i->second;
-            if (x.called) {
-              log("already called !? tensor %d\n", tensorIndex);
-              return;
-            }
-            if (x.tensorData.size() <= tensorIndex) {
-              if (x.requestBuffer) {
-                // If we received the main part of the request, then tensorData is resized
-                // to the exact number of tensors in the request.
-                log("received bad tensor\n");
-                bucket.map.erase(i);
-                std::abort();
-                return;
-              }
-              x.tensorData.resize(std::max((size_t)tensorIndex + 16, x.tensorData.size() + x.tensorData.size() / 2));
-            } else {
-              if (x.tensorData[tensorIndex].buffer) {
-                log("already has tensor data for this index!\n");
-                std::abort();
-                return;
-              }
-            }
-            x.tensorData[tensorIndex] = {std::move(inbuffer), offset, data};
-            ++x.receivedTensors;
-            if (x.requestBuffer && (size_t)x.receivedTensors >= x.tensorData.size()) {
-              log("do call yo got the last tensor\n");
-              x.called = true;
-              doCall = true;
-              createTensors(x, l);
-            }
-          }
-        }
-        if (doCall) {
-          f->call(std::move(inbuffer), [this, peer = &peer, rid](BufferHandle outbuffer) {
+        auto recvbuffer = handleRecv<true>(rpc.incoming_, peer, conn, rid, ptr, len);
+        if (recvbuffer) {
+          f->call(std::move(recvbuffer), [this, peer = &peer, rid](BufferHandle outbuffer) {
             auto* ptr = dataptr<std::byte>(&*outbuffer);
             std::memcpy(ptr, &rid, sizeof(rid));
-    //        ptr += sizeof(rid);
-    //        std::memcpy(ptr, &fid, sizeof(fid));
+            ptr += sizeof(rid);
+            uint32_t outFid;
+            std::memcpy(&outFid, ptr, sizeof(outFid));
+            ptr += sizeof(outFid);
+
+            std::vector<SharedBufferHandle> tensorbuffers;
+
+            if (outFid == Rpc::reqSuccess) {
+              uint32_t nTensors = outbuffer->nTensors;
+              std::memcpy(ptr, &nTensors, sizeof(nTensors));
+              ptr += sizeof(nTensors);
+              for (uint32_t i = 0; i != nTensors; ++i) {
+                auto& tensorRef = outbuffer->tensors()[i];
+                auto& tensor = tensorRef.tensor;
+                size_t nBytes = Rpc::Impl::computeStorageNbytes(tensor.sizes(), tensor.strides(), tensor.itemsize());
+                BufferHandle tmp;
+                serializeToBuffer(tmp, rid, outFid, (uint32_t)~0, i, (uint32_t)tensorRef.offset, std::string_view((const char*)tensor.data_ptr(), nBytes));
+                tensorbuffers.push_back(SharedBufferHandle(tmp.release()));
+              }
+            }
+
+            //std::memcpy(ptr, &fid, sizeof(fid));
             SharedBufferHandle shared(outbuffer.release());
             log("sending response for rid %#x of %d bytes to %s\n", rid, shared->size, peer->name);
             //conn->send(shared);
@@ -2422,15 +2563,26 @@ struct RpcImpl : RpcImplBase {
             Rpc::Impl::IncomingBucket& bucket = rpc.getBucket(rpc.incoming_, rid);
             std::lock_guard l2(rpc.incomingFifoMutex_);
             std::unique_lock l(bucket.mutex);
-            peer->banditSend(~0, shared);
+            //peer->banditSend(~0, shared);
             size_t totalResponseSize;
             auto i = bucket.map.find(rid);
             if (i != bucket.map.end()) {
               auto& x = bucket.map[rid];
               x.responseTimestamp = now;
               totalResponseSize = rpc.totalResponseSize_ += shared->size;
-              x.responseBuffer = std::move(shared);
+              x.timeout = now + std::chrono::milliseconds(250);
+              x.resend.buffer = std::move(shared);
+              log("x is %p, resend.buffer is %p\n", (void*)&x, (void*)&*x.resend.buffer);
+              rpc.resend(*peer, x.resend);
               listInsert(rpc.incomingFifo_.prev, &x);
+
+              for (auto& buffer : tensorbuffers) {
+                totalResponseSize = rpc.totalResponseSize_ += buffer->size;
+                x.resendTensors.emplace_back();
+                x.resendTensors.back().buffer = std::move(buffer);
+                rpc.resend(*peer, x.resendTensors.back());
+              }
+              rpc.updateTimeout(now + std::chrono::seconds(1));
             } else {
               totalResponseSize = rpc.totalResponseSize_;
             }
@@ -2448,12 +2600,17 @@ struct RpcImpl : RpcImplBase {
               }
               timeout = std::chrono::seconds(0);
               while (rpc.incomingFifo_.next != &rpc.incomingFifo_ && now - rpc.incomingFifo_.next->responseTimestamp >= timeout) {
-                auto* i = rpc.incomingFifo_.next;
+                Rpc::Impl::Incoming* i = rpc.incomingFifo_.next;
                 listErase(i);
                 auto& iBucket = rpc.getBucket(rpc.incoming_, i->rid);
                 std::lock_guard l3(iBucket.mutex);
-                if (i->responseBuffer) {
-                  rpc.totalResponseSize_ -= i->responseBuffer->size;
+                if (i->resend.buffer) {
+                  rpc.totalResponseSize_ -= i->resend.buffer->size;
+                }
+                for (auto& v : i->resendTensors) {
+                  if (v.buffer) {
+                    rpc.totalResponseSize_ -= v.buffer->size;
+                  }
                 }
                 iBucket.map.erase(i->rid);
                 log("permanent timeout of response !?\n");
@@ -2468,56 +2625,20 @@ struct RpcImpl : RpcImplBase {
 
   void onResponse(PeerImpl& peer, RpcConnectionImpl<API>& conn, uint32_t rid, uint32_t fid, const std::byte *ptr, size_t len) noexcept {
     rid |= 1;
-    if (fid == Rpc::reqAck) {
-      //log("got req ack, cool\n");
-      bool hasResponse;
-      uint32_t partIndex;
-      deserializeBuffer(ptr, len, hasResponse, partIndex);
-      auto& oBucket = rpc.getBucket(rpc.outgoing_, rid);
-      std::lock_guard l(oBucket.mutex);
-      auto i = oBucket.map.find(rid);
-      if (i != oBucket.map.end() && i->second.peer == &peer) {
-        Rpc::Impl::Outgoing& x = i->second;
-        auto now = std::chrono::steady_clock::now();
-        if (partIndex && partIndex - 1 >= x.tensors.size()) {
-          return;
-        }
-        auto& s = partIndex == 0 ? x.resend : x.tensors[partIndex - 1].resend;
-        if (!s.acked) {
-          if (s.pokeCount) {
-            --s.pokeCount;
-          }
-          s.acked = true;
-          s.ackTimestamp = now;
-          addLatency(peer, now, now - s.lastSendTimestamp, partIndex);
-        }
-        if (hasResponse && !x.serverHasResponse) {
-          x.serverHasResponse = true;
-          x.serverHasResponseTimestamp = now;
-        }
-      }
-      return;
-    } else if (fid == Rpc::reqNotFound) {
-      log("req not found. that's too bad, but we shouldn't really do anything about it\n");
-//      log("req not found, re-sending\n");
-//      auto& oBucket = rpc.getBucket(rpc.outgoing_, rid);
-//      std::unique_lock l(oBucket.mutex);
-//      auto i = oBucket.map.find(rid);
-//      if (i != oBucket.map.end() && i->second.peer != &peer) {
-//        log("rid collision on req not found! (not fatal error)\n");
-//        std::terminate();
-//      }
-//      if (i != oBucket.map.end() && i->second.peer == &peer) {
-//        Rpc::Impl::Outgoing& x = i->second;
-//        if (x.requestBuffer) {
-//          SharedBufferHandle r = x.requestBuffer;
-//          l.unlock();
-//          log("re-sending request of %d bytes\n", r->size);
-//          conn.send(r);
-//        }
-//      }
-      return;
-    } else if (fid == Rpc::reqPeerFound) {
+    switch (fid) {
+    case Rpc::reqPoke: {
+      handlePoke(rpc.outgoing_, peer, conn, rid, ptr, len);
+      break;
+    }
+    case Rpc::reqAck: {
+      handleAck<false>(rpc.outgoing_, peer, conn, rid, ptr, len);
+      break;
+    }
+    case Rpc::reqNack: {
+      handleNack(rpc.outgoing_, peer, conn, rid, ptr, len);
+      break;
+    }
+    case Rpc::reqPeerFound: {
       std::unordered_map<std::string_view, std::vector<ConnectionTypeInfo>> info;
       deserializeBuffer(ptr, len, info);
       for (auto& [name, vec] : info) {
@@ -2546,41 +2667,47 @@ struct RpcImpl : RpcImplBase {
           }
         }
       }
-      return;
-    } else if (fid == Rpc::reqFunctionNotFound || fid == Rpc::reqError || fid == Rpc::reqSuccess) {
-      BufferHandle buffer;
-      serializeToBuffer(buffer, rid, Rpc::reqAck);
-      //log("ack response for rid %#x\n", rid);
-      conn.send(std::move(buffer));
-      Rpc::ResponseCallback response;
-      {
-        auto& oBucket = rpc.getBucket(rpc.outgoing_, rid);
-        std::lock_guard l(oBucket.mutex);
-        auto i = oBucket.map.find(rid);
-        if (i != oBucket.map.end() && i->second.peer != &peer) {
-          log("rid collision on response! (not fatal error)\n");
-          std::terminate();
+      break;
+    }
+    case Rpc::reqFunctionNotFound:
+    case Rpc::reqError:
+    case Rpc::reqSuccess: {
+      auto buffer = handleRecv<false>(rpc.outgoing_, peer, conn, rid, ptr, len);
+      if (buffer) {
+        Rpc::ResponseCallback response;
+        {
+          auto& oBucket = rpc.getBucket(rpc.outgoing_, rid);
+          std::lock_guard l(oBucket.mutex);
+          auto i = oBucket.map.find(rid);
+          if (i != oBucket.map.end() && i->second.peer != &peer) {
+            log("rid collision on response! (not fatal error)\n");
+            std::terminate();
+          }
+          if (i != oBucket.map.end() && i->second.peer == &peer) {
+            response = std::move(i->second.response);
+            oBucket.map.erase(i);
+          } else {
+            log("got response for unknown rid %#x from %s\n", rid, peer.name);
+          }
         }
-        if (i != oBucket.map.end() && i->second.peer == &peer) {
-          response = std::move(i->second.response);
-          oBucket.map.erase(i);
-        } else {
-          log("got response for unknown rid %#x from %s\n", rid, peer.name);
+        if (response) {
+          if (fid == Rpc::reqFunctionNotFound) {
+            Error err("Remote function not found");
+            std::move(response)(std::move(buffer), &err);
+          } else if (fid == Rpc::reqError) {
+            std::string_view str;
+            deserializeBuffer(std::move(buffer), str);
+            Error err{"Remote exception during RPC call: " + std::string(str)};
+            std::move(response)(nullptr, &err);
+          } else if (fid == Rpc::reqSuccess) {
+            std::move(response)(std::move(buffer), nullptr);
+          }
         }
       }
-      if (response) {
-        if (fid == Rpc::reqFunctionNotFound) {
-          Error err("Remote function not found");
-          std::move(response)(nullptr, 0, &err);
-        } else if (fid == Rpc::reqError) {
-          std::string_view str;
-          deserializeBuffer(ptr, len, str);
-          Error err{"Remote exception during RPC call: " + std::string(str)};
-          std::move(response)(nullptr, 0, &err);
-        } else if (fid == Rpc::reqSuccess) {
-          std::move(response)(ptr, len, nullptr);
-        }
-      }
+      break;
+    }
+    default:
+      log("onResponse: unknown fid %#x\n", fid);
     }
   }
 

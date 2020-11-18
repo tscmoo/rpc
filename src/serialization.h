@@ -16,6 +16,10 @@
 
 namespace rpc {
 
+struct SerializationError: std::runtime_error{
+  using std::runtime_error::runtime_error;
+};
+
 template <typename X, typename A, typename B>
 void serialize(X& x, const std::pair<A, B>& v) {
   x(v.first, v.second);
@@ -160,17 +164,13 @@ template <typename X> void serialize(X& x, torch::Tensor& v) {
       v.as_strided_(sizes, strides);
     }
     if ((size_t)v.numel() != data.size() / v.dtype().itemsize()) {
-      throw std::runtime_error("numel mismatch in tensor deserialize");
+      throw SerializationError("numel mismatch in tensor deserialize");
     }
     std::memcpy(v.data_ptr(), data.data(), data.size());
   } else {
     v = std::move(x.getTensor().tensor);
   }
 }
-
-struct SerializationError: std::runtime_error{
-  using std::runtime_error::runtime_error;
-};
 
 struct OpSize {};
 struct OpWrite {};
@@ -323,6 +323,7 @@ struct Serialize {
 
 struct Deserialize {
   TensorRef* tensors = nullptr;
+  TensorRef* tensorsEnd = nullptr;
   Deserialize(Deserializer& des)
       : des(des) {
   }
@@ -373,6 +374,9 @@ struct Deserialize {
   }
 
   TensorRef& getTensor() {
+    if (tensors == tensorsEnd) {
+      throw SerializationError("Deserialize: reached end of tensor data");
+    }
     return *tensors++;
   }
 };
@@ -412,7 +416,11 @@ auto deserializeBuffer(Buffer* buffer, T&... result) {
   Deserializer des(std::string_view{(const char*)buffer->data(), buffer->size});
   Deserialize x(des);
   x.tensors = buffer->tensors();
+  x.tensorsEnd = x.tensors + buffer->nTensors;
   x(result...);
+  if (des.buf.size() != 0) {
+    throw SerializationError("deserializeBuffer: " + std::to_string(des.buf.size()) + " trailing bytes");
+  }
   return des.buf;
 }
 

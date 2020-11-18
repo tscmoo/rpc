@@ -49,7 +49,7 @@ struct RpcCallOptions {
 
 struct Rpc {
 
-  using ResponseCallback = Function<void(const void*, size_t, Error*)>;
+  using ResponseCallback = Function<void(BufferHandle buffer, Error*)>;
 
   Rpc();
   ~Rpc();
@@ -86,7 +86,7 @@ struct Rpc {
     reqFunctionNotFound,
     reqFindFunction,
     reqPoke,
-    reqNotFound,
+    //reqNotFound,
     reqLookingForPeer,
     reqPeerFound,
 
@@ -116,9 +116,9 @@ struct Rpc {
         auto out = [&]() {
           if constexpr (std::is_same_v<void, R>) {
             std::apply(f, std::move(args));
-            serializeToBuffer(outbuffer, (uint32_t)0, (uint32_t)reqSuccess);
+            serializeToBuffer(outbuffer, (uint32_t)0, (uint32_t)reqSuccess, (uint32_t)0);
           } else {
-            serializeToBuffer(outbuffer, (uint32_t)0, (uint32_t)reqSuccess, std::apply(f, std::move(args)));
+            serializeToBuffer(outbuffer, (uint32_t)0, (uint32_t)reqSuccess, (uint32_t)0, std::apply(f, std::move(args)));
           }
         };
         auto exceptionMode = rpc.currentExceptionMode_.load(std::memory_order_relaxed);
@@ -129,7 +129,7 @@ struct Rpc {
           try {
             in();
           } catch (const std::exception& e) {
-            serializeToBuffer(outbuffer, (uint32_t)0, (uint32_t)reqError, std::string_view(e.what()));
+            serializeToBuffer(outbuffer, (uint32_t)0, (uint32_t)reqError, (uint32_t)0, std::string_view(e.what()));
             return;
           }
           out();
@@ -138,7 +138,7 @@ struct Rpc {
             in();
             out();
           } catch (const std::exception& e) {
-            serializeToBuffer(outbuffer, (uint32_t)0, (uint32_t)reqError, std::string_view(e.what()));
+            serializeToBuffer(outbuffer, (uint32_t)0, (uint32_t)reqError, (uint32_t)0, std::string_view(e.what()));
           }
         }
         callback(std::move(outbuffer));
@@ -158,7 +158,7 @@ struct Rpc {
     serializeToBuffer(buffer, (uint32_t)0, (uint32_t)0, (uint32_t)0, args...);
     //printf("original buffer size is %d\n", buffer->size);
 
-    sendRequest(peerName, functionName, std::move(buffer), [callback = std::forward<Callback>(callback)](const void* ptr, size_t len, Error* error) noexcept {
+    sendRequest(peerName, functionName, std::move(buffer), [callback = std::forward<Callback>(callback)](BufferHandle buffer, Error* error) noexcept {
       if (error) {
         callback(nullptr, error);
         return;
@@ -170,7 +170,7 @@ struct Rpc {
           callback(&nonnull, nullptr);
         } else {
           R r;
-          deserializeBuffer(ptr, len, r);
+          deserializeBuffer(buffer, r);
           callback(&r, nullptr);
         }
       } catch (const std::exception& e) {
