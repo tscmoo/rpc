@@ -405,6 +405,21 @@ BufferHandle serializeToBuffer(const T&... v) {
 }
 
 template<typename... T>
+void serializeToStringView(std::string_view buffer, const T&... v) {
+  Serialize<OpSize> x{};
+  (x(v), ...);
+  size_t size = x.dst - (std::byte*)nullptr;
+  size_t nTensors = x.tensors - (TensorRef*)nullptr;
+  if (buffer.size() < size || nTensors) {
+    throw SerializationError("Data does not fit in target buffer");
+  }
+  std::byte* dst = (std::byte*)buffer.data();
+  Serialize<OpWrite> x2{dst, dst, nullptr};
+  (x2(v), ...);
+}
+
+
+template<typename... T>
 std::string_view deserializeBuffer(const void* ptr, size_t len, T&... result) {
   Deserializer des(std::string_view{(const char*)ptr, len});
   Deserialize x(des);

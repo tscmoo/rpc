@@ -4,7 +4,7 @@ project(rpc)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS
-    "${CMAKE_CXX_FLAGS} -Wfatal-errors")
+    "${CMAKE_CXX_FLAGS} -Wfatal-errors -march=native")
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
