@@ -19,6 +19,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <future>
 
 namespace rpc {
 
@@ -55,6 +56,7 @@ struct Rpc {
   ~Rpc();
 
   void setName(std::string_view name);
+  std::string_view getName() const;
   void setOnError(Function<void(const Error&)>&&);
   void listen(std::string_view addr);
   void connect(std::string_view addr);
@@ -158,26 +160,50 @@ struct Rpc {
     serializeToBuffer(buffer, (uint32_t)0, (uint32_t)0, (uint32_t)0, args...);
     //printf("original buffer size is %d\n", buffer->size);
 
-    sendRequest(peerName, functionName, std::move(buffer), [callback = std::forward<Callback>(callback)](BufferHandle buffer, Error* error) noexcept {
+    sendRequest(peerName, functionName, std::move(buffer), [callback = std::forward<Callback>(callback)](BufferHandle buffer, Error* error) mutable noexcept {
       if (error) {
-        callback(nullptr, error);
+        std::move(callback)(nullptr, error);
         return;
       }
       //printf("request got a response of %d bytes\n", len);
       try {
         if constexpr (std::is_same_v<R, void>) {
           char nonnull;
-          callback(&nonnull, nullptr);
+          std::move(callback)((void*)&nonnull, nullptr);
         } else {
           R r;
           deserializeBuffer(buffer, r);
-          callback(&r, nullptr);
+          std::move(callback)(&r, nullptr);
         }
       } catch (const std::exception& e) {
         Error err{std::string("Deserialization error: ") + e.what()};
-        callback(nullptr, &err);
+        std::move(callback)(nullptr, &err);
       }
     });
+  }
+
+  template<typename R = void, typename... Args>
+  std::future<R> async(std::string_view peerName, std::string_view functionName, const Args&... args) {
+    std::promise<R> promise;
+    auto future = promise.get_future();
+    asyncCallback<R>(peerName, functionName, [promise = std::move(promise)]([[maybe_unused]] R* ptr, Error* err) mutable {
+      if (err) {
+        promise.set_exception(std::make_exception_ptr(std::move(*err)));
+      } else {
+        if constexpr (std::is_same_v<R, void>) {
+          promise.set_value();
+        } else {
+          promise.set_value(std::move(*ptr));
+        }
+      }
+    }, args...);
+    return future;
+  }
+
+  template<typename R = void, typename... Args>
+  R sync(std::string_view peerName, std::string_view functionName, const Args&... args) {
+    auto future = async<R>(peerName, functionName, args...);
+    return future.get();
   }
 
   struct Impl;

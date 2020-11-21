@@ -32,7 +32,7 @@ struct Thread {
   int n = 0;
   template<typename WaitFunction>
   void entry(WaitFunction&& waitFunction) noexcept {
-    while (true) {
+    while (f) {
       Function<void()>{f}();
       f = nullptr;
       waitFunction(this);
@@ -57,12 +57,10 @@ struct ThreadPool {
     }
   }
   template<typename WaitFunction>
-  Thread* addThread(Function<void()>& f, WaitFunction&& waitFunction) noexcept {
+  bool addThread(Function<void()>& f, WaitFunction&& waitFunction) noexcept {
     std::unique_lock l(mutex);
     if (numThreads >= maxThreads) {
-      printf("throw away function!?\n");
-      std::abort();
-      return nullptr;
+      return false;
     }
     int n = ++numThreads;
     threads.emplace_back();
@@ -77,22 +75,34 @@ struct ThreadPool {
       sem.post();
       t->entry(std::move(waitFunction));
     });
-    while (!started) {
-      sem.wait();
-    }
-    return t;
+    sem.wait();
+    return true;
   }
 };
 
 struct SchedulerFifo {
   rpc::SpinMutex mutex;
+  bool terminate = false;
   std::vector<Thread*> idle;
   std::deque<FunctionPointer> queue;
 
   ThreadPool pool;
 
+  ~SchedulerFifo() {
+    std::unique_lock l(mutex);
+    terminate = true;
+    for (auto& v : idle) {
+      v->f = nullptr;
+      v->sem.post();
+    }
+    idle.clear();
+  }
+
   void wait(Thread* t) noexcept {
     std::unique_lock l(mutex);
+    if (terminate) {
+      return;
+    }
     if (!queue.empty()) {
       t->f = queue.front();
       queue.pop_front();

@@ -9,6 +9,8 @@
 #include <tensorpipe/transport/shm/connection.h>
 #include <tensorpipe/transport/uv/listener.h>
 #include <tensorpipe/transport/uv/connection.h>
+#include <tensorpipe/transport/ibv/listener.h>
+#include <tensorpipe/transport/ibv/connection.h>
 
 #include "fmt/printf.h"
 
@@ -22,6 +24,7 @@ std::mutex logMutex;
 
 template<typename... Args>
 void log(const char* fmt, Args&&... args) {
+  return;
   std::lock_guard l(logMutex);
   time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
   auto* tm = std::localtime(&now);
@@ -437,6 +440,22 @@ Listener Context::listen(std::string_view addr) {
 
 }
 
+std::string randomAddress() {
+  std::string s;
+  for (int i = 0; i != 2; ++i) {
+    uint64_t v = random<uint64_t>();
+    if (!s.empty()) {
+      s += "-";
+    }
+    for (size_t i = 0; i != 8; ++i) {
+      uint64_t sv = v >> (i * 8);
+      s += "0123456789abcdef"[(sv >> 4) & 0xf];
+      s += "0123456789abcdef"[sv & 0xf];
+    }
+  }
+  return s;
+}
+
 struct API_InProcess {
   using Context = inproc::Context;
   using Connection = std::unique_ptr<inproc::Connection>;
@@ -445,6 +464,20 @@ struct API_InProcess {
   static constexpr bool supportsBuffer = true;
   static constexpr bool persistentRead = true;
   static constexpr bool persistentAccept = true;
+  static constexpr bool addressIsIp = false;
+
+  static std::vector<std::string> defaultAddr() {
+    return {randomAddress()};
+  }
+  static std::string localAddr([[maybe_unused]] const Listener& listener, std::string addr) {
+    return addr;
+  }
+  static std::string localAddr([[maybe_unused]] const Connection&) {
+    return "";
+  }
+  static std::string remoteAddr([[maybe_unused]] const Connection&) {
+    return "";
+  }
 
   static auto& cast(Connection& x) {
     return *x;
@@ -465,19 +498,7 @@ struct API_TPSHM {
   static constexpr bool addressIsIp = false;
 
   static std::vector<std::string> defaultAddr() {
-    std::string s;
-    for (int i = 0; i != 2; ++i) {
-      uint64_t v = random<uint64_t>();
-      if (!s.empty()) {
-        s += "-";
-      }
-      for (size_t i = 0; i != 8; ++i) {
-        uint64_t sv = v >> (i * 8);
-        s += "0123456789abcdef"[(sv >> 4) & 0xf];
-        s += "0123456789abcdef"[sv & 0xf];
-      }
-    }
-    return {s};
+    return {randomAddress()};
   }
   static std::string localAddr([[maybe_unused]] const Listener& listener, std::string addr) {
     return addr;
@@ -534,6 +555,40 @@ struct API_TPUV {
   }
 };
 
+struct API_TPIBV {
+  using Context = tensorpipe::transport::ibv::Context;
+  using Connection = std::shared_ptr<tensorpipe::transport::Connection>;
+  using Listener = std::shared_ptr<tensorpipe::transport::Listener>;
+
+  static constexpr bool supportsBuffer = false;
+  static constexpr bool persistentRead = false;
+  static constexpr bool persistentAccept = false;
+  static constexpr bool addressIsIp = true;
+
+  static std::vector<std::string> defaultAddr() {
+    return {"0.0.0.0", "::"};
+  }
+  static std::string localAddr(const Listener& listener, [[maybe_unused]] std::string addr) {
+    return listener->addr();
+  }
+  static std::string localAddr([[maybe_unused]] const Connection&) {
+    return "";
+  }
+  static std::string remoteAddr([[maybe_unused]] const Connection&) {
+    return "";
+  }
+
+  static auto& cast(Connection& x) {
+    return (tensorpipe::transport::ibv::Connection&)*x;
+  }
+  static auto& cast(Listener& x) {
+    return (tensorpipe::transport::ibv::Listener&)*x;
+  }
+  static std::string errstr(const tensorpipe::Error& err) {
+    return err.what();
+  }
+};
+
 struct API_Network {
   using Context = network::Context;
   using Connection = network::Connection;
@@ -568,29 +623,63 @@ struct APIWrapper: API {
 enum class ConnectionType {
   uv,
   shm,
+  ibv,
+//  inproc,
   count
 };
 static std::array<const char*, (int)ConnectionType::count> connectionTypeName = {
   "TCP/IP",
-  "Shared memory"
+  "Shared memory",
+  "InfiniBand",
+//  "In-process"
 };
 
 template<typename API> struct index_t;
 template<> struct index_t<API_TPUV> { static constexpr ConnectionType value = ConnectionType::uv; };
 template<> struct index_t<API_TPSHM> { static constexpr ConnectionType value = ConnectionType::shm; };
+template<> struct index_t<API_TPIBV> { static constexpr ConnectionType value = ConnectionType::ibv; };
+//template<> struct index_t<API_InProcess> { static constexpr ConnectionType value = ConnectionType::inproc; };
 template<typename API> constexpr size_t index = (size_t)index_t<API>::value;
+
+template<typename F>
+auto switchOnAPI(ConnectionType t, F&& f) {
+  switch (t) {
+  case ConnectionType::uv:
+    return f(API_TPUV{});
+    break;
+  case ConnectionType::shm:
+    return f(API_TPSHM{});
+    break;
+  case ConnectionType::ibv:
+    return f(API_TPIBV{});
+    break;
+//  case ConnectionType::inproc:
+//    return f(API_InProcess{});
+//    break;
+  default:
+    std::abort();
+  }
+}
+
+template<typename F>
+auto switchOnScheme(std::string_view str, F&& f) {
+  if (str == "uv") {
+    return f(API_TPUV{});
+  } else if (str == "shm") {
+    return f(API_TPSHM{});
+  } else if (str == "ibv") {
+    return f(API_TPIBV{});
+  } else {
+    throw std::runtime_error("Unrecognized scheme '" + std::string(str) + "'");
+  }
+}
 
 template<typename T> struct RpcImpl;
 
 bool addressIsIp(ConnectionType t) {
-  switch (t) {
-  case ConnectionType::uv:
-    return true;
-  case ConnectionType::shm:
-    return false;
-  default:
-    std::abort();
-  }
+  return switchOnAPI(t, [](auto api) {
+    return decltype(api)::addressIsIp;
+  });
 }
 
 struct ConnectionTypeInfo {
@@ -618,6 +707,7 @@ struct RpcConnectionImplBase {
 struct RpcListenerImplBase {
   virtual ~RpcListenerImplBase() {}
 
+  virtual void close() = 0;
   virtual std::string localAddr() const {
     return "";
   }
@@ -792,8 +882,9 @@ struct PeerImpl {
       auto& v = connections_[i];
       if (willConnectOrSend(now, v)) {
         float score = std::exp(v.readBanditValue * 4);
+        log("bandit %s has score %g\n", connectionTypeName[i], score);
         sum += score;
-        list.emplace_back(i, score);
+        list.emplace_back(i, sum);
       }
     }
     if (list.size() > 0) {
@@ -806,21 +897,12 @@ struct PeerImpl {
           return a.second < b;
         })->first;
       }
-      //log("bandit chose %d (%s)\n", index, connectionTypeName.at(index));
+      log("bandit chose %d (%s)\n", index, connectionTypeName.at(index));
       auto& x = connections_.at(index);
       x.sendCount.fetch_add(1, std::memory_order_relaxed);
-      bool b;
-      switch (index) {
-      case (size_t)ConnectionType::uv:
-        b = send<API_TPUV>(now, buffer, outConnection);
-        break;
-      case (size_t)ConnectionType::shm:
-        b = send<API_TPSHM>(now, buffer, outConnection);
-        break;
-      default:
-        log("Unknown connection type %d\n", index);
-        std::abort();
-      }
+      bool b = switchOnAPI((ConnectionType)index, [&](auto api) {
+        return send<decltype(api)>(now, buffer, outConnection);
+      });
       if (!b && buffer) {
         mask &= ~(1 << index);
         return banditSend(mask, std::move(buffer), indexUsed);
@@ -955,14 +1037,17 @@ struct RpcConnectionImpl : RpcConnectionImplBase {
     if (dead.exchange(true, std::memory_order_relaxed)) {
       return;
     }
+    rpc.log("Connection %s closed\n", connectionTypeName[index<API>]);
     dead = true;
     API::cast(connection).close();
   }
 
   void onError([[maybe_unused]] Error* err) {
+    rpc.log("Connection %s error: %s\n", connectionTypeName[index<API>], err->what());
     close();
   }
   void onError([[maybe_unused]] const char* err) {
+    rpc.log("Connection %s error: %s\n", connectionTypeName[index<API>], err);
     close();
   }
 
@@ -975,7 +1060,7 @@ struct RpcConnectionImpl : RpcConnectionImplBase {
   static constexpr uint64_t kSignature = 0xff984b883019d443;
 
   void onData(const std::byte* ptr, size_t len) noexcept {
-    //log("got %d bytes\n", len);
+    log("got %d bytes\n", len);
     if (len < sizeof(uint32_t) * 2) {
       onError("Received not enough data");
       return;
@@ -1067,7 +1152,7 @@ struct RpcConnectionImpl : RpcConnectionImplBase {
   void send(Buffer buffer) {
     auto* ptr = buffer->data();
     size_t size = buffer->size;
-    //log("%p :: send %d bytes\n", this, size);
+    log("%p :: send %d bytes\n", (void*)this, size);
 //    if (random(0, 1) == 0) {
 //      return;
 //    }
@@ -1097,7 +1182,7 @@ struct RpcListenerImpl : RpcListenerImplBase {
     accept();
   }
   ~RpcListenerImpl() {
-    dead = true;
+    close();
     while (activeOps.load());
   }
   RpcImpl<API>& rpc;
@@ -1108,6 +1193,15 @@ struct RpcListenerImpl : RpcListenerImplBase {
 
   std::atomic<bool> dead = false;
   std::atomic_int activeOps{0};
+
+  virtual void close() override {
+    if (dead.exchange(true, std::memory_order_relaxed)) {
+      return;
+    }
+    rpc.log("Listener %s closed\n", connectionTypeName[index<API>]);
+    dead = true;
+    API::cast(listener).close();
+  }
 
   virtual std::string localAddr() const override {
     return API::localAddr(listener, addr);
@@ -1214,7 +1308,7 @@ struct Rpc::Impl {
   alignas(64) std::once_flag timeoutThreadOnce_;
   Semaphore timeoutSem_;
   std::atomic<std::chrono::steady_clock::time_point> timeout_ = std::chrono::steady_clock::now();
-  std::atomic<bool> timeoutDead_ = false;
+  std::atomic<bool> terminate_ = false;
 
   struct Outgoing {
     Outgoing* prev = nullptr;
@@ -1253,6 +1347,7 @@ struct Rpc::Impl {
   alignas(64) std::atomic<uint32_t> sequenceId{random<uint32_t>()};
 
   alignas(64) std::array<std::unique_ptr<RpcImplBase>, (int)ConnectionType::count> rpcs_;
+  std::array<std::once_flag, (int)ConnectionType::count> rpcsInited_{};
 
   alignas(64) PeerId myId = PeerId::generate();
   std::string_view myName = persistentString(myId.toString());
@@ -1282,14 +1377,23 @@ struct Rpc::Impl {
   std::atomic<bool> doingSetup_ = false;
   std::vector<ConnectionTypeInfo> info_;
 
+
   template<typename API>
-  void tryInitRpc(size_t index) {
+  void tryInitRpc() {
     try {
+      printf("init %s\n", connectionTypeName[index<API>]);
       auto u = std::make_unique<RpcImpl<API>>(*this);
-      rpcs_[index] = std::move(u);
+      rpcs_[index<API>] = std::move(u);
     } catch (const std::exception& e) {
-      log("Error during init of '%s': %s\n", connectionTypeName.at(index), e.what());
+      log("Error during init of '%s': %s\n", connectionTypeName.at(index<API>), e.what());
     }
+  }
+
+  template<typename API>
+  void lazyInitRpc() {
+    std::call_once(rpcsInited_[index<API>], [this]() {
+      tryInitRpc<API>();
+    });
   }
 
   Impl() {
@@ -1298,14 +1402,45 @@ struct Rpc::Impl {
     incomingFifo_.prev = &incomingFifo_;
     outgoingFifo_.next = &outgoingFifo_;
     outgoingFifo_.prev = &outgoingFifo_;
-
-    tryInitRpc<API_TPUV>((size_t)ConnectionType::uv);
-    tryInitRpc<API_TPSHM>((size_t)ConnectionType::shm);
   }
   virtual ~Impl() {
-    log("~Impl deadlock, fixme\n");
+    terminate_ = true;
     if (timeoutThread_.joinable()) {
+      timeoutSem_.post();
       timeoutThread_.join();
+    }
+    {
+      std::lock_guard l2(garbageMutex_);
+      std::lock_guard l(listenersMutex_);
+      std::lock_guard l3(peersMutex_);
+      for (auto& v : listeners_) {
+        for (auto& v2 : v.listeners) {
+          garbageListeners_.push_back(std::move(v2));
+        }
+        v.listeners.clear();
+      }
+      for (auto& v : peers_) {
+        for (auto& v2 : v.second.connections_) {
+          for (auto& v3 : v2.conns) {
+            garbageConnections_.push_back(std::move(v3));
+          }
+          v2.conns.clear();
+        }
+      }
+      for (auto& v : floatingConnections_) {
+        for (auto& v2 : v->conns) {
+          garbageConnections_.push_back(std::move(v2));
+        }
+      }
+      floatingConnections_.clear();
+    }
+    {
+      std::unique_lock l(garbageMutex_);
+      collect(l, garbageListeners_);
+      collect(l, garbageConnections_);
+    }
+    for (size_t i = 0; i != (size_t)ConnectionType::count; ++i) {
+      rpcs_[i] = nullptr;
     }
   }
 
@@ -1402,7 +1537,7 @@ struct Rpc::Impl {
     async::setCurrentThreadName("timeout");
     //std::this_thread::sleep_for(std::chrono::milliseconds(250));
     //log("timeout thread running (%s)!\n", std::string(myName).c_str());
-    while (!timeoutDead_.load(std::memory_order_relaxed)) {
+    while (!terminate_.load(std::memory_order_relaxed)) {
       auto now = std::chrono::steady_clock::now();
       if (lastRanMisc.load() + std::chrono::milliseconds(750) <= now) {
         lastRanMisc.store(now);
@@ -1495,6 +1630,7 @@ struct Rpc::Impl {
 
   template<typename API>
   void setup() noexcept {
+    lazyInitRpc<API>();
     auto& x = listeners_.at(index<API>);
     if (x.implicitCount > 0) {
       return;
@@ -1509,8 +1645,11 @@ struct Rpc::Impl {
       if (doingSetup_.exchange(true)) {
         while (!setupDone_);
       } else {
-        setup<API_TPUV>();
-        setup<API_TPSHM>();
+        for (size_t i = 0; i != (size_t)ConnectionType::count; ++i) {
+          switchOnAPI(ConnectionType(i), [&](auto api) {
+            setup<decltype(api)>();
+          });
+        }
 
         std::lock_guard l(listenersMutex_);
         info_.clear();
@@ -1538,6 +1677,7 @@ struct Rpc::Impl {
   template<typename API>
   void connect(std::string_view addr) {
     log("Connecting with %s to %s\n", connectionTypeName[index<API>], addr);
+    lazyInitRpc<API>();
     auto* u = getImpl<API>();
     if (!u) {
       throw std::runtime_error("Backend " + std::string(connectionTypeName.at(index<API>)) + " is not available");
@@ -1547,6 +1687,9 @@ struct Rpc::Impl {
 
     auto c = std::make_unique<Connection>();
     std::unique_lock l(listenersMutex_);
+    if (terminate_.load(std::memory_order_relaxed)) {
+      return;
+    }
     c->outgoing = true;
     c->addr = persistentString(addr);
     auto cu = std::make_unique<RpcConnectionImpl<API>>(*u, u->context.connect(std::string(addr)));
@@ -1559,6 +1702,7 @@ struct Rpc::Impl {
 
   template<typename API, bool explicit_ = true>
   auto listen(std::string_view addr) {
+    lazyInitRpc<API>();
     auto* u = getImpl<API>();
     if (!u) {
       if constexpr (!explicit_) {
@@ -1578,11 +1722,11 @@ struct Rpc::Impl {
       ++x.activeCount;
       ++(explicit_ ? x.explicitCount : x.implicitCount);
       x.listeners.push_back(std::move(i));
-      log("%s::listen(%s) success\n", std::string(myName).c_str(), std::string(addr).c_str());
+      log("%s::listen<%s, %d>(%s) success\n", myName, connectionTypeName[index<API>], explicit_, std::string(addr).c_str());
     } catch (const std::exception& e) {
       std::lock_guard l(garbageMutex_);
       garbageListeners_.push_back(std::move(i));
-      log("errror in listen(%s): %s\n", std::string(addr).c_str(), e.what());
+      log("errror in listen<%s, %d>(%s): %s\n", myName, connectionTypeName[index<API>], explicit_, e.what());
       if constexpr (!explicit_) {
         return false;
       } else {
@@ -1780,6 +1924,9 @@ struct Rpc::Impl {
     log("onAccept!()\n");
     getInfo();
     std::unique_lock l(listenersMutex_);
+    if (terminate_.load(std::memory_order_relaxed)) {
+      return;
+    }
     if (err) {
       log("accept error: %s\n", err->what());
       listener.active = false;
@@ -2120,7 +2267,7 @@ struct RpcImpl : RpcImplBase {
     float latency = std::min(us / 1000.0f, 10000.0f);
 
     if (latency >= 500) {
-      log("WARNING: connection %s part %d us is %lld, latency is %g\n", connectionTypeName[index<API>], partIndex, us, latency);
+      //log("WARNING: connection %s part %d us is %lld, latency is %g\n", connectionTypeName[index<API>], partIndex, us, latency);
       //std::abort();
     }
 
@@ -2364,7 +2511,7 @@ struct RpcImpl : RpcImplBase {
         }
         auto& s = partIndex == 0 ? x.resend : x.resendTensors[partIndex - 1];
         if (!s.acked) {
-          log("handleAck got ack for part %d\n", partIndex);
+          //log("handleAck got ack for part %d\n", partIndex);
           s.nackCount = 0;
           s.acked = true;
           s.ackTimestamp = now;
@@ -2417,7 +2564,7 @@ struct RpcImpl : RpcImplBase {
         log("nackCount is now %d\n", s.nackCount);
         if (s.nackCount >= 4) {
           log("nack resend\n");
-          std::abort();
+          //std::abort();
           if (!s.connection) {
             rpc.resend(peer, s);
           }
@@ -2756,14 +2903,50 @@ Rpc::Rpc() {
 }
 Rpc::~Rpc() {}
 
+std::pair<std::string_view, std::string_view> splitUri(std::string_view uri) {
+  const char* s = uri.begin();
+  const char* e = uri.end();
+  const char* i = s;
+  while (i != e) {
+    if (*i == ':') {
+      ++i;
+      return {std::string_view(uri.begin(), i - 1 - s), std::string_view(i, e - i)};
+    }
+    if (!std::islower(*i)) {
+      break;
+    }
+    ++i;
+  }
+  return {std::string_view(), std::string_view(s, e - s)};
+}
+
 void Rpc::listen(std::string_view addr) {
-  impl_->listen<API_TPUV>(addr);
+  auto [scheme, path] = splitUri(addr);
+  if (!scheme.empty()) {
+    switchOnScheme(scheme, [&, path = path](auto api) {
+      impl_->setupDone_ = true;
+      impl_->listen<decltype(api)>(path);
+    });
+  } else {
+    impl_->listen<API_TPUV>(addr);
+  }
 }
 void Rpc::connect(std::string_view addr) {
-  impl_->connect<API_TPUV>(addr);
+  auto [scheme, path] = splitUri(addr);
+  if (!scheme.empty()) {
+    switchOnScheme(scheme, [&, path = path](auto api) {
+      impl_->setupDone_ = true;
+      impl_->connect<decltype(api)>(path);
+    });
+  } else {
+    impl_->connect<API_TPUV>(addr);
+  }
 }
 void Rpc::setName(std::string_view name) {
   impl_->setName(name);
+}
+std::string_view Rpc::getName() const {
+  return impl_->myName;
 }
 void Rpc::sendRequest(std::string_view peerName, std::string_view functionName, BufferHandle buffer, ResponseCallback response) {
   impl_->sendRequest(peerName, functionName, std::move(buffer), std::move(response));
