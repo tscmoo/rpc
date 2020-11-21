@@ -25,6 +25,25 @@ extern "C" {
 
 namespace py = pybind11;
 
+std::pair<std::string_view, py::object> pyStrView(const py::handle& v) {
+  char *buffer;
+  ssize_t length;
+  if (PyUnicode_Check(v.ptr())) {
+      py::object o = py::reinterpret_steal<py::object>(PyUnicode_AsUTF8String(v.ptr()));
+      if (!o) {
+          py::pybind11_fail("Unable to extract string contents! (encoding issue)");
+      }
+      if (PYBIND11_BYTES_AS_STRING_AND_SIZE(o.ptr(), &buffer, &length)) {
+          py::pybind11_fail("Unable to extract string contents! (invalid type)");
+      }
+      return {std::string_view(buffer, (size_t) length), std::move(o)};
+  }
+  if (PYBIND11_BYTES_AS_STRING_AND_SIZE(v.ptr(), &buffer, &length)) {
+      py::pybind11_fail("Unable to extract string contents! (invalid type)");
+  }
+  return {std::string_view(buffer, (size_t) length), {}};
+}
+
 namespace rpc {
 
 enum pyTypes : uint8_t {
@@ -62,19 +81,7 @@ void serialize(X& x, const py::dict& v) {
 }
 template <typename X>
 void serialize(X& x, const py::str& v) {
-  py::object temp = v;
-  if (PyUnicode_Check(v.ptr())) {
-      temp = py::reinterpret_steal<py::object>(PyUnicode_AsUTF8String(v.ptr()));
-      if (!temp) {
-          py::pybind11_fail("Unable to extract string contents! (encoding issue)");
-      }
-  }
-  char *buffer;
-  ssize_t length;
-  if (PYBIND11_BYTES_AS_STRING_AND_SIZE(temp.ptr(), &buffer, &length)) {
-      py::pybind11_fail("Unable to extract string contents! (invalid type)");
-  }
-  x(std::string_view(buffer, (size_t) length));
+  x(pyStrView(v).first);
 }
 template <typename X>
 void serialize(X& x, const py::array& v) {
@@ -268,6 +275,48 @@ std::string randomName() {
   return r;
 }
 
+template<typename T>
+struct SharedPointer {
+  size_t offset = 0;
+  template<typename Shared>
+  T* operator()(Shared* shared) {
+    return (T*)((std::byte*)shared + offset);
+  }
+};
+
+template<typename T>
+struct SharedArray {
+  size_t size;
+  SharedPointer<T> data;
+
+  template<typename Shared>
+  std::basic_string_view<T> view(Shared* shared) {
+    return {data(shared), size};
+  }
+
+  template<typename Shared>
+  T& operator()(Shared* shared, size_t index) {
+    return data(shared)[index];
+  }
+  template<typename Shared>
+  T* operator()(Shared* shared) {
+    return data(shared);
+  }
+};
+
+struct SharedMapEntry {
+  SharedArray<char> key;
+  SharedArray<int64_t> shape;
+  SharedArray<std::byte> data;
+  size_t elements;
+  size_t itemsize;
+  char dtype;
+};
+
+struct BatchData {
+  SharedArray<SharedMapEntry> data;
+};
+
 
 struct Shared {
   std::atomic_bool initialized;
@@ -302,19 +351,50 @@ struct Shared {
 
     std::array<Input, 0x100> inputs;
 
+    std::once_flag batchAllocated;
+    BatchData batchData;
   };
 
   alignas(64) std::atomic_int clients = 0;
   std::array<Buffer, 2> buffers;
 
 
-  std::string_view allocate(size_t n) {
-    n = (n + 63) / 64 * 64;
+  std::byte* allocateNonAligned(size_t n) {
     size_t offset = allocated.fetch_add(n, std::memory_order_relaxed);
     if (offset + n > size) {
       throw std::runtime_error("Out of space in shared memory buffer");
     }
-    return {(const char*)this + offset, n};
+    return (std::byte*)this + offset;
+  }
+
+  template<typename T>
+  SharedArray<T> allocate(size_t n) {
+    size_t offset = allocated.fetch_add(sizeof(T) * n, std::memory_order_relaxed);
+    if (offset + n > size) {
+      throw std::runtime_error("Out of space in shared memory buffer");
+    }
+    return {n, {offset}};
+  }
+
+  template<typename T>
+  SharedArray<T> allocateAligned(size_t n) {
+    size_t offset = allocated.load(std::memory_order_relaxed);
+    size_t newOffset;
+    do {
+      newOffset = (offset + 63) / 64 * 64;
+    } while (!allocated.compare_exchange_weak(offset, newOffset + sizeof(T) * n, std::memory_order_relaxed));
+    if (newOffset + n > size) {
+      throw std::runtime_error("Out of space in shared memory buffer");
+    }
+    return {n, {newOffset}};
+  }
+
+  template<typename T>
+  SharedArray<T> allocateString(std::basic_string_view<T> str) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    auto r = allocate<T>(str.size());
+    std::memcpy(r(this), str.data(), sizeof(T) * str.size());
+    return r;
   }
 };
 
@@ -324,7 +404,7 @@ struct Env {
   py::object step_;
 
   int steps = 0;
-  std::string_view outbuffer;
+  //std::string_view outbuffer;
 
   Env(py::object env) {
     py::gil_scoped_acquire gil;
@@ -340,7 +420,83 @@ struct Env {
     step_ = {};
   }
 
-  bool step(Shared* shared) {
+  std::list<std::string> strings;
+  std::unordered_map<std::string_view, size_t> keyIndices;
+
+  void allocateBatch(Shared* shared, BatchData& batch, const py::dict& obs) {
+    std::unordered_map<std::string_view, bool> added;
+    struct I {
+      std::string key;
+      std::vector<int64_t> shape;
+      size_t elements;
+      size_t itemsize;
+      char dtype;
+    };
+    std::vector<I> fields;
+    auto add = [&](std::string_view key, size_t dims, const ssize_t* shape, size_t itemsize, char dtype) {
+      if (std::exchange(added[key], true)) {
+        throw std::runtime_error("key " + std::string(key) + " already exists in batch!");
+      }
+      size_t elements = 1;
+      for (size_t i = 0; i != dims; ++i) {
+        elements *= shape[i];
+      }
+      fields.emplace_back();
+      auto& f = fields.back();
+      f.key = key;
+      f.shape.assign(shape, shape + dims);
+      f.elements = elements;
+      f.itemsize = itemsize;
+      f.dtype = dtype;
+    };
+    for (auto& [key, value] : obs) {
+      auto [str, stro] = pyStrView(key);
+      py::array arr = py::reinterpret_borrow<py::object>(value);
+      add(str, arr.ndim(), arr.shape(), arr.itemsize(), arr.dtype().kind());
+    }
+    std::array<ssize_t, 1> s{1};
+    add("done", 1, s.data(), 1, 'b');
+    add("reward", 1, s.data(), 4, 'f');
+
+    batch.data = shared->allocate<SharedMapEntry>(fields.size());
+    for (size_t i = 0; i != fields.size(); ++i) {
+      auto& f = fields[i];
+      auto& d = batch.data(shared, i);
+      d.key = shared->allocateString(std::string_view(f.key));
+    }
+    for (size_t i = 0; i != fields.size(); ++i) {
+      auto& f = fields[i];
+      auto& d = batch.data(shared, i);
+      d.data = shared->allocateAligned<std::byte>(f.itemsize * f.elements * shared->buffers[0].inputs.size());
+      d.shape = shared->allocate<int64_t>(f.shape.size());
+      for (size_t i2 = 0; i2 != f.shape.size(); ++i2) {
+        d.shape(shared, i2) = f.shape[i2];
+      }
+      d.elements = f.elements;
+      d.itemsize = f.itemsize;
+      d.dtype = f.dtype;
+    }
+    printf("allocated %d bytes\n", (int)shared->allocated);
+  }
+
+  void fillBatch(Shared* shared, BatchData& batch, size_t batchIndex, std::string_view key, void* src, size_t len) {
+    auto* map = batch.data(shared);
+    for (size_t i = 0; i != batch.data.size; ++i) {
+      auto& v = map[i];
+      if (v.key.view(shared) == key) {
+        std::byte* dst = v.data(shared);
+        dst += v.elements * batchIndex;
+        if (len != v.itemsize * v.elements) {
+          throw std::runtime_error("fill batch size mismatch");
+        }
+        std::memcpy(dst, src, v.itemsize * v.elements);
+        return;
+      }
+    }
+    throw std::runtime_error(std::string(key) + ": batch key not found");
+  }
+
+  bool step(Shared* shared, size_t bufferIndex, size_t batchIndex) {
     auto start = std::chrono::steady_clock::now();
     ++steps;
     int action = std::uniform_int_distribution<size_t>(0, 10)(threadRng);
@@ -349,14 +505,27 @@ struct Env {
       py::gil_scoped_acquire gil;
       py::tuple tup = step_(action);
       //printf("tuple has %zu\n", tup.size());
+      py::dict obs = tup[0];
+      float reward = (py::float_)tup[1];
       done = (py::bool_)tup[2];
-      if (outbuffer.size() == 0) {
-        rpc::BufferHandle buffer = rpc::serializeToBuffer(tup);
-        printf("Result serialized to %d bytes\n", buffer->size);
-        outbuffer = shared->allocate(buffer->size + buffer->size / 2);
-        printf("allocated to %p, size %d\n", outbuffer.data(), outbuffer.size());
+      auto& batch = shared->buffers[bufferIndex].batchData;
+      std::call_once(shared->buffers[bufferIndex].batchAllocated, [&]() {
+        allocateBatch(shared, batch, obs);
+      });
+      fillBatch(shared, batch, batchIndex, "done", &done, sizeof(bool));
+      fillBatch(shared, batch, batchIndex, "reward", &reward, sizeof(float));
+      for (auto& [key, value] : obs) {
+        auto [str, stro] = pyStrView(key);
+        py::array arr(py::reinterpret_borrow<py::array>(value));
+        fillBatch(shared, batch, batchIndex, str, (float*)arr.data(), arr.nbytes());
       }
-      rpc::serializeToStringView(outbuffer);
+//      if (outbuffer.size() == 0) {
+//        rpc::BufferHandle buffer = rpc::serializeToBuffer(tup);
+//        printf("Result serialized to %d bytes\n", buffer->size);
+//        outbuffer = shared->allocate(buffer->size + buffer->size / 2);
+//        printf("allocated to %p, size %d\n", outbuffer.data(), outbuffer.size());
+//      }
+//      rpc::serializeToStringView(outbuffer);
     } catch (const pybind11::error_already_set &e) {
       printf("step error %s\n", e.what());
       throw;
@@ -405,14 +574,14 @@ struct EnvBatch {
     py::gil_scoped_acquire gil;
     envInit_ = {};
   }
-  void step(size_t size, Shared* shared) {
+  void step(size_t size, Shared* shared, size_t bufferIndex, size_t batchIndex) {
     while (envs.size() < size) {
       py::gil_scoped_acquire gil;
       envs.emplace_back(envInit_());
       envs.back().reset();
     }
     for (auto& v : envs) {
-      while (!v.step(shared)) {
+      while (!v.step(shared, bufferIndex, batchIndex)) {
         v.reset();
       }
     }
@@ -595,7 +764,7 @@ struct TestClient {
           break;
         }
         //printf("oh boy i got a task for %d steps\n", nSteps - stepsDone);
-        batch.at(bufferIndex).step(nSteps - stepsDone, &shared);
+        batch.at(bufferIndex).step(nSteps - stepsDone, &shared, bufferIndex, myIndex);
         input.nStepsOut.store(nSteps, std::memory_order_relaxed);
 
 //        if (buffer.remaining.fetch_sub(1, std::memory_order_relaxed) == 1) {
