@@ -3,9 +3,15 @@
 
 #include <pybind11/numpy.h>
 
+#include <torch/python.h>
+#include <torch/torch.h>
+#include <torch/cuda.h>
+
 #include "job.h"
 
 #include "rpc.h"
+
+#include "fmt/printf.h"
 
 #include <cmath>
 #include <random>
@@ -24,6 +30,33 @@ extern "C" {
 
 
 namespace py = pybind11;
+
+py::object pyLogging;
+
+std::mutex logMutex;
+
+template<typename... Args>
+void log(const char* fmt, Args&&... args) {
+  std::lock_guard l(logMutex);
+  time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+  auto* tm = std::localtime(&now);
+  char buf[0x40];
+  std::strftime(buf, sizeof(buf), "%d-%m-%Y %H:%M:%S", tm);
+  auto s = fmt::sprintf(fmt, std::forward<Args>(args)...);
+  if (pyLogging.is_none()) {
+    if (!s.empty() && s.back() == '\n') {
+      fmt::printf("%s: %s", buf, s);
+    } else {
+      fmt::printf("%s: %s\n", buf, s);
+    }
+  } else {
+    if (s.size() && s.back() == '\n') {
+      s.pop_back();
+    }
+    py::gil_scoped_acquire gil;
+    pyLogging.attr("info")(fmt::sprintf("%s: %s", buf, s));
+  }
+}
 
 std::pair<std::string_view, py::object> pyStrView(const py::handle& v) {
   char *buffer;
@@ -62,7 +95,7 @@ void serialize(X& x, const py::bool_& v) {
   } else if (v.ptr() == Py_False) {
     x(false);
   } else {
-    printf("bad bool\n");
+    log("bad bool\n");
     std::abort();
   }
 }
@@ -141,11 +174,11 @@ void serialize(X& x, const py::tuple& v) {
 
 struct SharedMemory {
   int fd = -1;
-  size_t size = 1024 * 1024 * 10;
+  size_t size = 1024 * 1024 * 100;
   std::byte* data = nullptr;
   std::string name;
   SharedMemory(std::string_view name) : name(name) {
-    printf("creating shm %s\n", std::string(name).c_str());
+    log("creating shm %s\n", name);
     fd = shm_open(std::string(name).c_str(), O_RDWR | O_CREAT, ACCESSPERMS);
     if (fd < 0) {
       throw std::system_error(errno, std::system_category());
@@ -153,7 +186,7 @@ struct SharedMemory {
     ftruncate(fd, size);
     data = (std::byte*)mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (!data) {
-      throw std::system_error(errno, std::system_category());
+      throw std::system_error(errno, std::system_category(), "mmap");
     }
   }
   ~SharedMemory() {
@@ -164,7 +197,7 @@ struct SharedMemory {
   template<typename T>
   T& as() {
     if (sizeof(T) > size) {
-      printf("%s is too big for shm :(\n", typeid(T).name());
+      log("%s is too big for shm :(\n", typeid(T).name());
       std::abort();
     }
     ((T*)data)->init(size);
@@ -317,6 +350,8 @@ struct BatchData {
   SharedArray<SharedMapEntry> data;
 };
 
+constexpr size_t maxClients = 0x100;
+constexpr size_t maxEnvs = 0x1000;
 
 struct Shared {
   std::atomic_bool initialized;
@@ -338,18 +373,24 @@ struct Shared {
 
   struct Buffer {
 
-    struct Input {
-      //Semaphore sem;
-      //std::atomic_int nSteps = 0;
-      alignas(64) std::atomic_size_t nStepsIn = 0;
-      alignas(64) std::atomic_size_t nStepsOut = 0;
-
+    struct ClientInput {
+      std::atomic_size_t nStepsIn = 0;
+      std::atomic_size_t resultOffset = 0;
+    };
+    struct alignas(64) ClientOutput {
+      std::atomic_size_t nStepsOut = 0;
     };
 
-    //alignas(64) std::atomic_int remaining = 0;
-    //Semaphore doneSem;
+    struct EnvInput {
+      int action = 0;
+    };
 
-    std::array<Input, 0x100> inputs;
+    size_t size = 0;
+    size_t stride = 0;
+
+    std::array<ClientInput, maxClients> clientInputs;
+    std::array<EnvInput, maxEnvs> envInputs;
+    std::array<ClientOutput, maxClients> clientOutputs;
 
     std::once_flag batchAllocated;
     BatchData batchData;
@@ -420,9 +461,6 @@ struct Env {
     step_ = {};
   }
 
-  std::list<std::string> strings;
-  std::unordered_map<std::string_view, size_t> keyIndices;
-
   void allocateBatch(Shared* shared, BatchData& batch, const py::dict& obs) {
     std::unordered_map<std::string_view, bool> added;
     struct I {
@@ -467,7 +505,7 @@ struct Env {
     for (size_t i = 0; i != fields.size(); ++i) {
       auto& f = fields[i];
       auto& d = batch.data(shared, i);
-      d.data = shared->allocateAligned<std::byte>(f.itemsize * f.elements * shared->buffers[0].inputs.size());
+      d.data = shared->allocateAligned<std::byte>(f.itemsize * f.elements * maxEnvs);
       d.shape = shared->allocate<int64_t>(f.shape.size());
       for (size_t i2 = 0; i2 != f.shape.size(); ++i2) {
         d.shape(shared, i2) = f.shape[i2];
@@ -476,7 +514,7 @@ struct Env {
       d.itemsize = f.itemsize;
       d.dtype = f.dtype;
     }
-    printf("allocated %d bytes\n", (int)shared->allocated);
+    log("allocated %d bytes\n", (int)shared->allocated);
   }
 
   void fillBatch(Shared* shared, BatchData& batch, size_t batchIndex, std::string_view key, void* src, size_t len) {
@@ -485,7 +523,7 @@ struct Env {
       auto& v = map[i];
       if (v.key.view(shared) == key) {
         std::byte* dst = v.data(shared);
-        dst += v.elements * batchIndex;
+        dst += v.itemsize * v.elements * batchIndex;
         if (len != v.itemsize * v.elements) {
           throw std::runtime_error("fill batch size mismatch");
         }
@@ -496,18 +534,29 @@ struct Env {
     throw std::runtime_error(std::string(key) + ": batch key not found");
   }
 
-  bool step(Shared* shared, size_t bufferIndex, size_t batchIndex) {
+  void step(Shared* shared, size_t bufferIndex, size_t batchIndex) {
     auto start = std::chrono::steady_clock::now();
     ++steps;
     int action = std::uniform_int_distribution<size_t>(0, 10)(threadRng);
-    bool done;
     try {
       py::gil_scoped_acquire gil;
-      py::tuple tup = step_(action);
-      //printf("tuple has %zu\n", tup.size());
-      py::dict obs = tup[0];
-      float reward = (py::float_)tup[1];
-      done = (py::bool_)tup[2];
+      bool done;
+      float reward;
+      py::dict obs;
+      if (steps == 1) {
+        done = false;
+        reward = 0.0f;
+        obs = reset_();
+        //pyLogging.attr("info")(py::str(obs["blstats"]));
+      } else {
+        py::tuple tup = step_(action);
+        obs = tup[0];
+        reward = (py::float_)tup[1];
+        done = (py::bool_)tup[2];
+        if (done) {
+          obs = reset_();
+        }
+      }
       auto& batch = shared->buffers[bufferIndex].batchData;
       std::call_once(shared->buffers[bufferIndex].batchAllocated, [&]() {
         allocateBatch(shared, batch, obs);
@@ -521,19 +570,18 @@ struct Env {
       }
 //      if (outbuffer.size() == 0) {
 //        rpc::BufferHandle buffer = rpc::serializeToBuffer(tup);
-//        printf("Result serialized to %d bytes\n", buffer->size);
+//        log("Result serialized to %d bytes\n", buffer->size);
 //        outbuffer = shared->allocate(buffer->size + buffer->size / 2);
-//        printf("allocated to %p, size %d\n", outbuffer.data(), outbuffer.size());
+//        log("allocated to %p, size %d\n", outbuffer.data(), outbuffer.size());
 //      }
 //      rpc::serializeToStringView(outbuffer);
     } catch (const pybind11::error_already_set &e) {
-      printf("step error %s\n", e.what());
+      log("step error %s\n", e.what());
       throw;
     }
     counter.fetch_add(1, std::memory_order_relaxed);
     steptime += (std::chrono::steady_clock::now() - start).count();
     //if (steps >= 50000) std::abort();
-    return !done;
   }
 
   void reset() {
@@ -551,14 +599,14 @@ struct Env {
         int cn = counter;
         int n = cn - lastcount;
         float nps = n / s;
-        printf("%d,  %g/s\n", n, nps);
+        log("%d,  %g/s\n", n, nps);
 
         lastcount = cn;
 
         astart = start;
       }
     } catch (const pybind11::error_already_set &e) {
-      printf("reset error %s\n", e.what());
+      log("reset error %s\n", e.what());
       throw;
     }
     resettime += (std::chrono::steady_clock::now() - start).count();
@@ -578,14 +626,20 @@ struct EnvBatch {
     while (envs.size() < size) {
       py::gil_scoped_acquire gil;
       envs.emplace_back(envInit_());
-      envs.back().reset();
     }
     for (auto& v : envs) {
-      while (!v.step(shared, bufferIndex, batchIndex)) {
-        v.reset();
-      }
+      v.step(shared, bufferIndex, batchIndex);
+      ++batchIndex;
     }
   }
+};
+
+struct LocalBuffer {
+  std::vector<torch::Tensor> inputShared;
+  std::vector<torch::Tensor> inputPinned;
+  std::vector<torch::Tensor> inputDevice;
+  std::map<std::string, torch::Tensor> inputMap;
+  std::vector<torch::Tensor> modelStates;
 };
 
 struct TestJob {
@@ -598,9 +652,10 @@ struct TestJob {
   SharedMemory shm{shmname};
   Shared* shared = &shm.as<Shared>();
 
-  EnvBatch localBatch;
+  py::object model_;
+  std::string deviceStr_;
 
-  TestJob(py::object envInit) : localBatch(std::move(envInit)) {
+  TestJob(py::object model, std::string deviceStr) : model_(std::move(model)), deviceStr_(deviceStr) {
   }
   ~TestJob() {
     terminate_ = true;
@@ -615,12 +670,44 @@ struct TestJob {
     });
   }
 
+  struct EnvState {
+    std::vector<torch::Tensor> modelState;
+  };
+
+  struct ClientState {
+    std::vector<EnvState> states;
+  };
+
+  template<typename T>
+  std::string sizesStr(T&& sizes) {
+    std::string s = "{";
+    for (auto& v : sizes) {
+      if (s.size() > 1) {
+        s += ", ";
+      }
+      s += std::to_string(v);
+    }
+    s += "}";
+    return s;
+  }
+
   void run() {
+
+    torch::NoGradGuard ng;
+
+    torch::Device device(deviceStr_);
 
     Timer t;
     int count = 0;
 
     size_t bufferCounter = 0;
+
+    std::vector<LocalBuffer> local;
+
+    local.resize(shared->buffers.size());
+
+    async::SchedulerFifo asyncforward;
+    asyncforward.pool.maxThreads = shared->buffers.size();
 
     while (!terminate_) {
 
@@ -631,34 +718,199 @@ struct TestJob {
 
       size_t nClients = shared->clients;
 
-      if (nClients > shared->buffers[0].inputs.size()) {
+      if (nClients > maxClients) {
         throw std::runtime_error("Too many clients connected!");
       }
 
-      size_t size = 100;
+      auto forwardBuffer = [&](size_t bufferIndex) {
+        auto& buffer = shared->buffers[bufferIndex];
+        auto& lbuf = local[bufferIndex];
 
-      size_t strideDivisor = nClients;
-      size_t stride = (size + strideDivisor - 1) / strideDivisor;
+        size_t size = buffer.size;
+        size_t stride = buffer.stride;
+        size_t clientIndex = 0;
+        if (size == 0) {
+          return;
+        }
+        for (size_t i = 0; i < size; i += stride, ++clientIndex) {
+//          int nSteps = std::min(size - i, stride);
+//          if (clientStates.size() <= clientIndex || clientStates[clientIndex].states.size() < nSteps) {
+//            throw std::runtime_error("clientStates mismatch");
+//          }
+          auto& input = buffer.clientInputs[clientIndex];
+          auto& output = buffer.clientOutputs[clientIndex];
+          size_t prevSteps = input.nStepsIn.load(std::memory_order_acquire);
+          while (output.nStepsOut.load(std::memory_order_relaxed) != prevSteps && !terminate_) {
+            _mm_pause();
+          }
+        }
+        if (lbuf.inputMap.empty()) {
+          std::map<std::string, torch::Tensor> map;
+          auto* src = buffer.batchData.data(shared);
+          for (size_t i = 0; i != buffer.batchData.data.size; ++i) {
+            auto key = src[i].key.view(shared);
+            auto& v = src[i];
+            torch::TensorOptions opts;
+            switch (v.dtype) {
+            case 'f':
+              if (v.itemsize == 2) {
+                opts = opts.dtype(torch::kFloat16);
+              } else if (v.itemsize == 4) {
+                opts = opts.dtype(torch::kFloat32);
+              } else if (v.itemsize == 8) {
+                opts = opts.dtype(torch::kFloat64);
+              } else {
+                throw std::runtime_error("Unexpected itemsize for float");
+              }
+              break;
+            case 'i':
+              if (v.itemsize == 1) {
+                opts = opts.dtype(torch::kInt8);
+              } else if (v.itemsize == 2) {
+                opts = opts.dtype(torch::kInt16);
+              } else if (v.itemsize == 4) {
+                opts = opts.dtype(torch::kInt32);
+              } else if (v.itemsize == 8) {
+                opts = opts.dtype(torch::kInt64);
+              } else throw std::runtime_error("Unexpected itemsize for int");
+              break;
+            case 'u':
+              if (v.itemsize == 1) {
+                opts = opts.dtype(torch::kUInt8);
+              } else throw std::runtime_error("Unexpected itemsize for unsigned int");
+              break;
+            case 'b':
+              if (v.itemsize == 1) {
+                opts = opts.dtype(torch::kBool);
+              } else throw std::runtime_error("Unexpected itemsize for boolean");
+              break;
+            default:
+              throw std::runtime_error("Unsupported dtype '" + std::string(1, v.dtype) + "'");
+            }
 
-      auto fillBuffer = [&](Shared::Buffer& buffer) {
+            std::vector<int64_t> sizes(v.shape(shared), v.shape(shared) + v.shape.size);
+            sizes.insert(sizes.begin(), (int64_t)maxEnvs);
+            map[std::string(key)] = torch::from_blob(v.data(shared), sizes, opts);
+          }
+          for (auto& [key, value] : map) {
+            //log("map [%s] sizes = %s\n", key, sizesStr(value.sizes()));
+            lbuf.inputMap[key] = torch::Tensor();
+            lbuf.inputShared.push_back(value);
+            lbuf.inputPinned.push_back(value.pin_memory());
+            lbuf.inputDevice.push_back(value.to(device));
+          }
+        }
+//        auto& input = inputTmp;
+//        for (auto& [key, value] : mapCpuShared) {
+//          auto n = value.narrow(0, 0, size);
+//          if (key != "done") {
+//            n = n.unsqueeze(0); // Create T dimension
+//          }
+//          input[key] = n.to(device);
+//        }
+        auto& input = lbuf.inputMap;
+        size_t index = 0;
+        for (auto& [key, value] : input) {
+          auto shared = lbuf.inputShared.at(index).narrow(0, 0, size);
+          auto pinned = lbuf.inputPinned.at(index).narrow(0, 0, size);
+          auto device = lbuf.inputDevice.at(index).narrow(0, 0, size);
+          pinned.copy_(shared);
+          device.copy_(pinned, true);
+          value = device;
+          if (key != "done") {
+            value = value.unsqueeze(0);
+          }
+          ++index;
+        }
+//        for (auto& [key, value] : input) {
+//          log("input [%s] sizes = %s\n", key, sizesStr(value.sizes()));
+//        }
+//        auto& state = stateTmp;
+//        state.resize(ms.size());
+//        for (size_t i = 0; i != state.size(); ++i) {
+//          if ((size_t)ms[i].size(1) != size) {
+//            throw std::runtime_error("model state size mismatch");
+//          }
+//          state[i] = ms[i].narrow(1, 0, size);
+//          //log("state[%d].sum() is %g\n", i, state[i].sum().item<float>());
+//        }
+//        for (size_t i = 0; i != state.size(); ++i) {
+//          log("state [%d] sizes = {%s}\n", i, sizesStr(state[i].sizes()));
+//        }
+//        log("doing forward!\n");
+        py::gil_scoped_acquire gil;
+        py::tuple tup = model_(input, lbuf.modelStates);
+//        py::dict output = tup[0];
+//        py::tuple outstate = tup[1];
+//        for (size_t i = 0; i != ms.size(); ++i) {
+//          ms[i] = outstate[i].cast<torch::Tensor>();
+//        }
+      };
+
+      auto fillBuffer = [&](size_t bufferIndex) {
         //buffer.remaining.store((size + stride - 1) / stride, std::memory_order_relaxed);
+        auto& buffer = shared->buffers[bufferIndex];
+        auto& ms = local[bufferIndex].modelStates;
+
+        size_t size = 256;
+
+        size_t strideDivisor = nClients;
+        size_t stride = (size + strideDivisor - 1) / strideDivisor;
+
+        if (buffer.size != size) {
+          if (ms.empty()) {
+            py::gil_scoped_acquire gil;
+            py::tuple is = model_.attr("initial_state")(size);
+            for (auto& v : is) {
+              auto t = v.cast<torch::Tensor>();
+              ms.push_back(t.to(device));
+            }
+          } else {
+            throw std::runtime_error("fixme: resize ms");
+          }
+        }
+
+        buffer.size = size;
+        buffer.stride = stride;
+
         size_t clientIndex = 0;
         for (size_t i = 0; i < size; i += stride, ++clientIndex) {
           int nSteps = std::min(size - i, stride);
-          auto& input = buffer.inputs[clientIndex];
-          //input.nSteps = nSteps;
-          size_t prevSteps = input.nStepsIn.load(std::memory_order_relaxed);
-          while (input.nStepsOut.load(std::memory_order_relaxed) != prevSteps && !terminate_) {
-            _mm_pause();
-          }
-          input.nStepsIn.store(prevSteps + nSteps, std::memory_order_relaxed);
+//          while (clientStates.size() <= clientIndex) {
+//            clientStates.emplace_back();
+//          }
+//          auto& cs = clientStates[clientIndex];
+//          while (cs.states.size() < (size_t)nSteps) {
+//            py::gil_scoped_acquire gil;
+//            cs.states.emplace_back();
+//            auto is = model_.attr("initial_state")();
+//            for (auto& v : is.cast<py::tuple>()) {
+//              log("its a tuple okay\n");
+//              log("its a %s\n", std::string(py::str(v.get_type())).c_str());
+//              cs.states.back().modelState.push_back(v.cast<torch::Tensor>());
+//            }
+//            //cs.states.back().modelState = .cast<std::vector<torch::Tensor>>();;
+//            log("got new initial state yey\n");
+//          }
+          auto& input = buffer.clientInputs[clientIndex];
+//          auto& output = buffer.clientOutputs[clientIndex];
+//          //input.nSteps = nSteps;
+          size_t prevSteps = input.nStepsIn.load(std::memory_order_acquire);
+//          while (input.nStepsOut.load(std::memory_order_relaxed) != prevSteps && !terminate_) {
+//            _mm_pause();
+//          }
+          input.resultOffset.store(i, std::memory_order_relaxed);
+          input.nStepsIn.store(prevSteps + nSteps, std::memory_order_release);
         }
       };
 
 //      localBatch.step(stride);
 //      count += stride;
 
-      fillBuffer(shared->buffers[bufferCounter % shared->buffers.size()]);
+      size_t bufferIndex = bufferCounter % shared->buffers.size();
+      auto& buffer = shared->buffers[bufferIndex];
+      forwardBuffer(bufferIndex);
+      fillBuffer(bufferIndex);
       ++bufferCounter;
       //size_t currentIndex = bufferCounter % shared->buffers.size();
 
@@ -669,13 +921,13 @@ struct TestJob {
         break;
       }
 
-      count += size;
+      count += buffer.size;
 
       if (t.elapsed() >= 1.0f) {
         float tx = t.elapsedReset();
         int n = count;
         count = 0;
-        printf("rate %g/s\n", n / tx);
+        log("rate %g/s\n", n / tx);
       }
     }
 
@@ -738,9 +990,9 @@ struct TestClient {
 
       int myIndex = shared.clients++;
 
-      printf("my index is %d\n", myIndex);
+      log("my index is %d\n", myIndex);
 
-      if ((size_t)myIndex > shared.buffers[0].inputs.size()) {
+      if ((size_t)myIndex > maxClients) {
         throw std::runtime_error("Client index is too high");
       }
 
@@ -750,12 +1002,13 @@ struct TestClient {
         size_t bufferIndex = bufferCounter % shared.buffers.size();
         auto& buffer = shared.buffers[bufferIndex];
         ++bufferCounter;
-        auto& input = buffer.inputs[myIndex];
-        size_t stepsDone = input.nStepsOut.load(std::memory_order_relaxed);
-        size_t nSteps = input.nStepsIn.load(std::memory_order_relaxed);
+        auto& input = buffer.clientInputs[myIndex];
+        auto& output = buffer.clientOutputs[myIndex];
+        size_t stepsDone = output.nStepsOut.load(std::memory_order_relaxed);
+        size_t nSteps = input.nStepsIn.load(std::memory_order_acquire);
         while (nSteps == stepsDone) {
           _mm_pause();
-          nSteps = input.nStepsIn.load(std::memory_order_relaxed);
+          nSteps = input.nStepsIn.load(std::memory_order_acquire);
           if (terminate_.load(std::memory_order_relaxed)) {
             break;
           }
@@ -763,9 +1016,10 @@ struct TestClient {
         if (terminate_.load(std::memory_order_relaxed)) {
           break;
         }
-        //printf("oh boy i got a task for %d steps\n", nSteps - stepsDone);
-        batch.at(bufferIndex).step(nSteps - stepsDone, &shared, bufferIndex, myIndex);
-        input.nStepsOut.store(nSteps, std::memory_order_relaxed);
+        size_t offset = input.resultOffset;
+        //log("oh boy i got a task for %d steps\n", nSteps - stepsDone);
+        batch.at(bufferIndex).step(nSteps - stepsDone, &shared, bufferIndex, offset);
+        output.nStepsOut.store(nSteps, std::memory_order_relaxed);
 
 //        if (buffer.remaining.fetch_sub(1, std::memory_order_relaxed) == 1) {
 //          //shared->doneSem.post();
@@ -781,8 +1035,11 @@ struct TestClient {
 
 
 PYBIND11_MODULE(pyjob, m) {
+  m.def("set_logging", [](py::object logging) {
+    pyLogging = logging;
+  });
   py::class_<TestJob>(m, "TestJob")
-      .def(py::init<py::object>())
+      .def(py::init<py::object, std::string>())
       .def("start", &TestJob::start)
       .def("get_name", &TestJob::getName);
   py::class_<TestClient>(m, "TestClient")

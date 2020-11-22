@@ -46,4 +46,4 @@ target_link_libraries(jobtest Threads::Threads dl)
 target_include_directories(jobtest PUBLIC nle/include/)
 
 pybind11_add_module(pyjob src/pyjob.cc)
-target_link_libraries(pyjob PUBLIC rpc)
+target_link_libraries(pyjob PUBLIC rpc ${TorchPath}/lib/libtorch_python.so)
