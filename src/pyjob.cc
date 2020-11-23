@@ -185,9 +185,11 @@ struct SharedMemory {
     log("creating shm %s\n", name);
     fd = shm_open(std::string(name).c_str(), O_RDWR | O_CREAT, ACCESSPERMS);
     if (fd < 0) {
-      throw std::system_error(errno, std::system_category());
+      throw std::system_error(errno, std::system_category(), "shm_open");
     }
-    ftruncate(fd, size);
+    if (ftruncate(fd, size)) {
+      throw std::system_error(errno, std::system_category(), "ftruncate");
+    }
     data = (std::byte*)mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (!data) {
       throw std::system_error(errno, std::system_category(), "mmap");
@@ -412,7 +414,7 @@ struct Shared {
   };
 
   alignas(64) std::atomic_int clients = 0;
-  std::array<Buffer, 4> buffers;
+  std::array<Buffer, 2> buffers;
 
 
   std::byte* allocateNonAligned(size_t n) {
@@ -620,11 +622,11 @@ struct Env {
       py::dict obs;
       float localEpisodeReturn = episodeReturn;
       uint32_t localEpisodeStep = episodeStep;
+      //log("buffer %d index %d step\n", bufferIndex, batchIndex);
       if (steps == 1) {
         done = false;
         reward = 0.0f;
         obs = reset_();
-        //pyLogging.attr("info")(py::str(obs["blstats"]));
       } else {
         py::tuple tup = step_(action);
         obs = tup[0];
@@ -737,6 +739,29 @@ struct LocalBuffer {
   std::vector<torch::Tensor> outputDeviceSeq;
 
   size_t currentSequenceIndex = 0;
+
+  alignas(64) std::atomic_int stepCount = 0;
+  std::atomic_bool busy = false;
+};
+
+std::mutex profileMutex;
+std::map<std::string_view, float> profileTimes;
+
+struct Profile {
+  std::string_view name;
+  Timer t;
+  bool running = true;
+  Profile(std::string_view name) : name(name) {}
+  ~Profile() {
+    stop();
+  }
+  void stop() {
+    if (running) {
+      running = false;
+      std::lock_guard l(profileMutex);
+      profileTimes[name] += t.elapsed();
+    }
+  }
 };
 
 struct TestJob {
@@ -807,12 +832,17 @@ struct TestJob {
 
     size_t bufferCounter = 0;
 
-    std::vector<LocalBuffer> local;
+    std::deque<LocalBuffer> local;
 
     local.resize(shared->buffers.size());
 
     async::SchedulerFifo asyncforward;
     asyncforward.pool.maxThreads = 1;
+
+    async::SchedulerFifo asyncAction;
+    asyncAction.pool.maxThreads = 2;
+
+    std::mutex modelMutex;
 
     size_t nClients = 0;
 
@@ -838,9 +868,6 @@ struct TestJob {
     log("Using an unroll length of %d and a batch size of %d\n", unrollLength, batchSize);
 
     Timer mainTimer;
-    float pythonTime = 0.0f;
-    float waitTime = 0.0f;
-    float syncTime = 0.0f;
 
     while (!terminate_) {
 
@@ -852,6 +879,8 @@ struct TestJob {
         auto& buffer = shared->buffers[bufferIndex];
         auto& lbuf = local[bufferIndex];
 
+        while (lbuf.busy);
+
         std::optional<c10::cuda::CUDAStreamGuard> streamGuard;
         if (isCuda) {
           lbuf.cudaStream = c10::cuda::getStreamFromPool(false, device.index());
@@ -862,21 +891,56 @@ struct TestJob {
         size_t stride = buffer.stride;
         size_t clientIndex = 0;
         if (size == 0) {
+
+          size_t size = batchSize;
+
+          size_t strideDivisor = nClients;
+          size_t stride = (size + strideDivisor - 1) / strideDivisor;
+
+          buffer.size = size;
+          buffer.stride = stride;
+
+          size_t clientIndex = 0;
+          for (size_t i = 0; i < size; i += stride, ++clientIndex) {
+            int nSteps = std::min(size - i, stride);
+            auto& input = buffer.clientInputs[clientIndex];
+  //          if (hasAction) {
+  //            for (size_t s = i; s != i + nSteps; ++s) {
+  //              //log("setting action %d for buffer %d index %d\n", (*acc)[0][s], bufferIndex, s);
+  //              buffer.envInputs[s].action.store((*acc)[0][s], std::memory_order_relaxed);
+  //            }
+  //          }
+            input.resultOffset.store(i, std::memory_order_release);
+            input.nStepsIn.fetch_add(nSteps, std::memory_order_acq_rel);
+          }
+
+          auto& ms = lbuf.modelStates;
+          if (ms.empty()) {
+            py::gil_scoped_acquire gil;
+            py::tuple is = model_.attr("initial_state")(size);
+            for (auto& v : is) {
+              auto t = v.cast<torch::Tensor>();
+              ms.push_back(t.to(device));
+            }
+          } else {
+            throw std::runtime_error("fixme: resize ms");
+          }
+
           return;
         }
+        lbuf.busy = true;
         for (size_t i = 0; i < size; i += stride, ++clientIndex) {
 //          int nSteps = std::min(size - i, stride);
 //          if (clientStates.size() <= clientIndex || clientStates[clientIndex].states.size() < nSteps) {
 //            throw std::runtime_error("clientStates mismatch");
 //          }
-          Timer t;
+          Profile pf("wait");
           auto& input = buffer.clientInputs[clientIndex];
           auto& output = buffer.clientOutputs[clientIndex];
           size_t prevSteps = input.nStepsIn.load(std::memory_order_acquire);
           while (output.nStepsOut.load(std::memory_order_relaxed) != prevSteps && !terminate_) {
             _mm_pause();
           }
-          waitTime += t.elapsed();
         }
         if (lbuf.inputMap.empty()) {
           std::map<std::string, torch::Tensor> map;
@@ -890,7 +954,7 @@ struct TestJob {
             map[std::string(key)] = torch::from_blob(v.data(shared), sizes, opts);
           }
           for (auto& [key, value] : map) {
-            log("map [%s] sizes = %s\n", key, sizesStr(value.sizes()));
+            log("input [%s] sizes = %s\n", key, sizesStr(value.sizes()));
             lbuf.inputMap[key] = torch::Tensor();
             lbuf.inputShared.push_back(value);
             if (isCuda) {
@@ -912,225 +976,230 @@ struct TestJob {
 //          }
 //          input[key] = n.to(device);
 //        }
-        auto& input = lbuf.inputMap;
-        auto& ms = lbuf.modelStates;
-        size_t index = 0;
-        for (auto& [key, value] : input) {
-          auto device = lbuf.inputDeviceSeq.at(index).select(0, lbuf.currentSequenceIndex).narrow(0, 0, size);
-          value = device;
-          auto shared = lbuf.inputShared.at(index).narrow(0, 0, size);
-          if (isCuda) {
-            auto pinned = lbuf.inputPinned.at(index).narrow(0, 0, size);
-            pinned.copy_(shared, true);
-            if (!pinned.is_pinned()) {
-              throw std::runtime_error("pinned is not pinned!");
-            }
-            value.copy_(pinned, true);
-          } else {
-            value.copy_(shared);
-          }
-          value = value.unsqueeze(0);
-          ++index;
-        }
+
 //          for (auto& [key, value] : input) {
 //            log("input [%s] sizes = %s\n", key, sizesStr(value.sizes()));
 //          }
-        torch::Tensor action;
-        std::map<std::string, torch::Tensor> outputMap;
-        {
-          torch::AutoGradMode grad(true);
-          Timer t;
-          py::gil_scoped_acquire gil;
-          py::tuple tup = model_(input, ms, true);
-          py::dict output = tup[0];
-          py::tuple outstate = tup[1];
-          for (size_t i = 0; i != ms.size(); ++i) {
-            ms[i] = outstate[i].cast<torch::Tensor>();
-          }
-          outputMap = output.cast<std::map<std::string, torch::Tensor>>();
-
-          pythonTime += t.elapsed();
-        }
-        action = outputMap["action"];
-        if (action.dim() != 2 || action.size(0) != 1 || (size_t)action.size(1) != size) {
-          throw std::runtime_error("Expected action output of size {1, " + std::to_string(size) + "}, got " + sizesStr(action.sizes()));
-        }
-        auto& actionPinned = lbuf.actionPinned;
-        if (isCuda) {
-          if (!actionPinned.defined()) {
-            auto vec = action.sizes().vec();
-            vec.at(1) = maxEnvs;
-            actionPinned = torch::empty(vec, torch::TensorOptions(action.dtype()).pinned_memory(true));
-          }
-          if (!actionPinned.is_pinned()) {
-            throw std::runtime_error("actionPinned is not pinned!");
-          }
-          actionPinned.narrow(1, 0, size).copy_(action, true);
-        } else {
-          actionPinned = action;
-        }
-        if (lbuf.outputMap.empty()) {
-          lbuf.outputMap = outputMap;
-          for (auto& [key, value] : outputMap) {
-            auto sizes = value.sizes().vec();
-            if (sizes.size() < 2) {
-              throw std::runtime_error("Model output has not enough dimensions");
-            }
-            sizes.at(0) = unrollLength;
-            sizes.at(1) = batchSize;
-            auto opts = torch::TensorOptions(value.dtype()).device(device);
-            lbuf.outputDeviceSeq.push_back(torch::empty(sizes, opts));
-
-            log("new output device seq [%s] = %s\n", key, sizesStr(sizes));
-          }
-        } else if (lbuf.outputMap.size() != outputMap.size()) {
-          throw std::runtime_error("Inconsistent model output dict");
-        }
-
-        torch::AutoGradMode grad(true);
-        index = 0;
-        for (auto& [key, value] : outputMap) {
-          if (value.size(0) != 1) {
-            throw std::runtime_error("Expected size 1 in first dimension, got " + sizesStr(value.sizes()));
-          }
-          lbuf.outputDeviceSeq[index].select(0, lbuf.currentSequenceIndex).copy_(value.select(0, 0), true);
-          ++index;
-        }
-        if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
-          log("Stepping buffer %d\n", bufferIndex);
-          index = 0;
-          for (auto& [key, value] : input) {
-            //log("input [%s] = %s\n", key, sizesStr(value.sizes()));
-            value = lbuf.inputDeviceSeq.at(index);
-            ++index;
-          }
-          index = 0;
-          //log("lbuf.outputDeviceSeq.size() is %d\n", lbuf.outputDeviceSeq.size());
-          for (auto& [key, value] : outputMap) {
-            //log("output [%s] = %s\n", key, sizesStr(value.sizes()));
-            value = lbuf.outputDeviceSeq.at(index);
-            ++index;
-          }
-          //auto msStack = torch::stack(ms);
-          {
-            //py::gil_scoped_acquire gil;
-            //learner_.attr("step")(input, outputMap);
-          }
-          lbuf.currentSequenceIndex = 0;
-
-          for (auto& v : ms) {
-            v.detach_();
-          }
-          for (auto& v : lbuf.inputDeviceSeq) {
-            v.detach_();
-          }
-          for (auto& v : lbuf.outputDeviceSeq) {
-            v.detach_();
-          }
-
-          log("Buffer %d stepped\n", bufferIndex);
-
-          if (bufferIndex == shared->buffers.size() - 1) {
-            log("Stepping optimizer\n");
-            {
-              //py::gil_scoped_acquire gil;
-              //learner_.attr("step_optimizer")();
-            }
-          }
-
-          float tt = mainTimer.elapsed();
-          auto ts = [&](float v) {
-            return fmt::sprintf("%g (%g%%)", v, v * 100 / tt);
-          };
-          log("total time: %g, python: %s wait: %s sync: %s\n", tt, ts(pythonTime), ts(waitTime), ts(syncTime));
-        } else {
-          ++lbuf.currentSequenceIndex;
-        }
-      };
-
-      auto doFillBuffer = [&](size_t bufferIndex) {
-        //buffer.remaining.store((size + stride - 1) / stride, std::memory_order_relaxed);
-        auto& buffer = shared->buffers[bufferIndex];
-        auto& lbuf = local[bufferIndex];
-        auto& ms = lbuf.modelStates;
-
-        size_t size = batchSize;
-
-        size_t strideDivisor = nClients;
-        size_t stride = (size + strideDivisor - 1) / strideDivisor;
-
-        if (buffer.size != size) {
-          if (ms.empty()) {
-            py::gil_scoped_acquire gil;
-            py::tuple is = model_.attr("initial_state")(size);
-            for (auto& v : is) {
-              auto t = v.cast<torch::Tensor>();
-              ms.push_back(t.to(device));
-            }
-          } else {
-            throw std::runtime_error("fixme: resize ms");
-          }
-        }
-
-        buffer.size = size;
-        buffer.stride = stride;
-
-        auto& action = lbuf.actionPinned;
-        std::optional<torch::TensorAccessor<long, 2>> acc;
-        bool hasAction = action.defined();
-        if (hasAction) {
+        asyncforward.run([&, size, stride, bufferIndex]() {
+          Profile p("aforward");
+          std::optional<c10::cuda::CUDAStreamGuard> streamGuard;
           if (isCuda) {
-            Timer t;
-            lbuf.cudaStream->synchronize();
-            syncTime += t.elapsed();
+            streamGuard.emplace(*lbuf.cudaStream);
           }
-          if (action.scalar_type() != torch::kLong) {
-            std::cout << "action is " << action.dtype() << "\n";
-            throw std::runtime_error("model output action type mismatch");
-          }
-          acc = action.accessor<long, 2>();
-          if (acc->size(0) != 1 || (size_t)acc->size(1) != maxEnvs) {
-            log("size is %d, acc size is %s\n", size, sizesStr(acc->sizes()));
-            throw std::runtime_error("model output action size mismatch");
-          }
-        }
 
-        size_t clientIndex = 0;
-        for (size_t i = 0; i < size; i += stride, ++clientIndex) {
-          int nSteps = std::min(size - i, stride);
-          auto& input = buffer.clientInputs[clientIndex];
-          if (hasAction) {
-            for (size_t s = i; s != i + nSteps; ++s) {
-              //log("setting action %d for buffer %d index %d\n", (*acc)[0][s], bufferIndex, s);
-              buffer.envInputs[s].action.store((*acc)[0][s], std::memory_order_relaxed);
+          //std::lock_guard l(modelMutex);
+
+          Profile pprepare("prepare");
+          auto& input = lbuf.inputMap;
+          auto& ms = lbuf.modelStates;
+          size_t index = 0;
+          for (auto& [key, value] : input) {
+            auto device = lbuf.inputDeviceSeq.at(index).select(0, lbuf.currentSequenceIndex).narrow(0, 0, size);
+            value = device;
+            auto shared = lbuf.inputShared.at(index).narrow(0, 0, size);
+            if (isCuda) {
+              auto pinned = lbuf.inputPinned.at(index).narrow(0, 0, size);
+              pinned.copy_(shared, true);
+              if (!pinned.is_pinned()) {
+                throw std::runtime_error("pinned is not pinned!");
+              }
+              value.copy_(pinned, true);
+            } else {
+              value.copy_(shared);
             }
+            value = value.unsqueeze(0);
+            ++index;
           }
-          input.resultOffset.store(i, std::memory_order_release);
-          input.nStepsIn.fetch_add(nSteps, std::memory_order_acq_rel);
-        }
-      };
 
-//      localBatch.step(stride);
-//      count += stride;
+          size_t clientIndex = 0;
+          for (size_t i = 0; i < size; i += stride, ++clientIndex) {
+            int nSteps = std::min(size - i, stride);
+            auto& input = buffer.clientInputs[clientIndex];
+  //          if (hasAction) {
+  //            for (size_t s = i; s != i + nSteps; ++s) {
+  //              //log("setting action %d for buffer %d index %d\n", (*acc)[0][s], bufferIndex, s);
+  //              buffer.envInputs[s].action.store((*acc)[0][s], std::memory_order_relaxed);
+  //            }
+  //          }
+            input.resultOffset.store(i, std::memory_order_release);
+            input.nStepsIn.fetch_add(nSteps, std::memory_order_acq_rel);
+          }
+
+//          for (auto& [key, value] : input) {
+//            log("input [%s] sizes = %s\n", key, sizesStr(value.sizes()));
+//            log("sum %g\n", value.sum().item<float>());
+//          }
+
+          pprepare.stop();
+
+          torch::Tensor action;
+          std::map<std::string, torch::Tensor> outputMap;
+          {
+            torch::AutoGradMode grad(true);
+            Profile p("python model forward");
+            py::gil_scoped_acquire gil;
+            py::tuple tup = model_(input, ms, true);
+            py::dict output = tup[0];
+            py::tuple outstate = tup[1];
+            for (size_t i = 0; i != ms.size(); ++i) {
+              ms[i] = outstate[i].cast<torch::Tensor>();
+            }
+            outputMap = output.cast<std::map<std::string, torch::Tensor>>();
+          }
+          Profile paction("action");
+          action = outputMap["action"];
+          if (action.dim() != 2 || action.size(0) != 1 || (size_t)action.size(1) != size) {
+            throw std::runtime_error("Expected action output of size {1, " + std::to_string(size) + "}, got " + sizesStr(action.sizes()));
+          }
+          auto& actionPinned = lbuf.actionPinned;
+          if (isCuda) {
+            if (!actionPinned.defined()) {
+              auto vec = action.sizes().vec();
+              vec.at(1) = maxEnvs;
+              actionPinned = torch::empty(vec, torch::TensorOptions(action.dtype()).pinned_memory(true));
+            }
+            if (!actionPinned.is_pinned()) {
+              throw std::runtime_error("actionPinned is not pinned!");
+            }
+            actionPinned.narrow(1, 0, size).copy_(action, true);
+          } else {
+            actionPinned = action;
+          }
+          paction.stop();
+          if (lbuf.outputMap.empty()) {
+            lbuf.outputMap = outputMap;
+            for (auto& [key, value] : outputMap) {
+              auto sizes = value.sizes().vec();
+              if (sizes.size() < 2) {
+                throw std::runtime_error("Model output has not enough dimensions");
+              }
+              sizes.at(0) = unrollLength;
+              sizes.at(1) = batchSize;
+              auto opts = torch::TensorOptions(value.dtype()).device(device);
+              lbuf.outputDeviceSeq.push_back(torch::empty(sizes, opts));
+
+              log("new output device seq [%s] = %s\n", key, sizesStr(sizes));
+            }
+          } else if (lbuf.outputMap.size() != outputMap.size()) {
+            throw std::runtime_error("Inconsistent model output dict");
+          }
+
+          Profile poutput("output");
+          torch::GradMode::set_enabled(true);
+          index = 0;
+          for (auto& [key, value] : outputMap) {
+            if (value.size(0) != 1) {
+              throw std::runtime_error("Expected size 1 in first dimension, got " + sizesStr(value.sizes()));
+            }
+            lbuf.outputDeviceSeq[index].select(0, lbuf.currentSequenceIndex).copy_(value.select(0, 0), true);
+            ++index;
+          }
+          poutput.stop();
+          torch::GradMode::set_enabled(false);
+          asyncAction.run([this, &buffer, &lbuf, size, isCuda, stream = isCuda ? std::make_optional<c10::cuda::CUDAStream>(streamGuard->current_stream()) : std::optional<c10::cuda::CUDAStream>{}]() {
+            if (isCuda) {
+              Profile p("synchronize");
+              stream->synchronize();
+            }
+            auto& action = lbuf.actionPinned;
+            if (action.scalar_type() != torch::kLong) {
+              std::cout << "action is " << action.dtype() << "\n";
+              throw std::runtime_error("model output action type mismatch");
+            }
+            auto acc = action.accessor<long, 2>();
+            if (acc.size(0) != 1 || (size_t)acc.size(1) != maxEnvs) {
+              log("size is %d, acc size is %s\n", size, sizesStr(acc.sizes()));
+              throw std::runtime_error("model output action size mismatch");
+            }
+            for (size_t i = 0; i != size; ++i) {
+              buffer.envInputs[i].action.store(acc[0][i], std::memory_order_relaxed);
+              //buffer.envInputs[i].action.store(10, std::memory_order_relaxed);
+            }
+          });
+          if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
+            Profile p("step");
+            torch::GradMode::set_enabled(true);
+            //log("Stepping buffer %d\n", bufferIndex);
+            index = 0;
+            for (auto& [key, value] : input) {
+              //log("input [%s] = %s\n", key, sizesStr(value.sizes()));
+              value = lbuf.inputDeviceSeq.at(index);
+              ++index;
+            }
+            index = 0;
+            //log("lbuf.outputDeviceSeq.size() is %d\n", lbuf.outputDeviceSeq.size());
+            for (auto& [key, value] : outputMap) {
+              //log("output [%s] = %s\n", key, sizesStr(value.sizes()));
+              value = lbuf.outputDeviceSeq.at(index);
+              ++index;
+            }
+            //auto msStack = torch::stack(ms);
+            {
+              Profile p("python step");
+              py::gil_scoped_acquire gil;
+              learner_.attr("step")(input, outputMap);
+            }
+            lbuf.currentSequenceIndex = 0;
+
+            for (auto& v : ms) {
+              v.detach_();
+            }
+            for (auto& v : lbuf.inputDeviceSeq) {
+              v.detach_();
+            }
+            for (auto& v : lbuf.outputDeviceSeq) {
+              v.detach_();
+            }
+
+            //log("Buffer %d stepped\n", bufferIndex);
+
+            int stepCount = ++lbuf.stepCount;
+
+            if (bufferIndex == shared->buffers.size() - 1) {
+              Profile p("python step_optimizer");
+              //log("Stepping optimizer\n");
+              for (auto& v : local) {
+                while (v.stepCount != stepCount);
+              }
+              {
+                py::gil_scoped_acquire gil;
+                learner_.attr("step_optimizer")();
+              }
+            }
+
+            p.stop();
+
+            float tt = mainTimer.elapsed();
+            auto ts = [&](float v) {
+              return fmt::sprintf("%g (%g%%)", v, v * 100 / tt);
+            };
+            std::string s;
+            std::lock_guard l(profileMutex);
+            for (auto& [key, value] : profileTimes) {
+              if (!s.empty()) {
+                s += " ";
+              }
+              s += key;
+              s += ": ";
+              s += ts(value);
+            }
+            log("total time: %g, %s\n", tt, s);
+          } else {
+            ++lbuf.currentSequenceIndex;
+          }
+          lbuf.busy = false;
+        });
+      };
 
       size_t forwardBufferIndex = (bufferCounter) % shared->buffers.size();
-      size_t fillBufferIndex = bufferCounter % shared->buffers.size();
-      auto& fillBuffer = shared->buffers[fillBufferIndex];
-      //log("forward %d\n", forwardBufferIndex);
       doForwardBuffer(forwardBufferIndex);
-      //log("fill %d\n", fillBufferIndex);
-      doFillBuffer(fillBufferIndex);
       ++bufferCounter;
-      //size_t currentIndex = bufferCounter % shared->buffers.size();
 
-      //while (!terminate_.load(std::memory_order_relaxed) && shared->buffers[currentIndex].remaining.load(std::memory_order_relaxed));
-
-      //shared->doneSem.wait();
       if (terminate_) {
         break;
       }
 
-      count += fillBuffer.size;
+      count += batchSize;
 
       if (t.elapsed() >= 1.0f) {
         float tx = t.elapsedReset();
