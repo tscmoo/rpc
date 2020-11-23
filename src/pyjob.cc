@@ -3,6 +3,8 @@
 
 #include <pybind11/numpy.h>
 
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <torch/python.h>
 #include <torch/torch.h>
 #include <torch/cuda.h>
@@ -38,23 +40,24 @@ std::mutex logMutex;
 template<typename... Args>
 void log(const char* fmt, Args&&... args) {
   std::lock_guard l(logMutex);
-  time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-  auto* tm = std::localtime(&now);
-  char buf[0x40];
-  std::strftime(buf, sizeof(buf), "%d-%m-%Y %H:%M:%S", tm);
-  auto s = fmt::sprintf(fmt, std::forward<Args>(args)...);
   if (pyLogging.is_none()) {
+    time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    auto* tm = std::localtime(&now);
+    char buf[0x40];
+    std::strftime(buf, sizeof(buf), "%d-%m-%Y %H:%M:%S", tm);
+    auto s = fmt::sprintf(fmt, std::forward<Args>(args)...);
     if (!s.empty() && s.back() == '\n') {
       fmt::printf("%s: %s", buf, s);
     } else {
       fmt::printf("%s: %s\n", buf, s);
     }
   } else {
+    auto s = fmt::sprintf(fmt, std::forward<Args>(args)...);
     if (s.size() && s.back() == '\n') {
       s.pop_back();
     }
     py::gil_scoped_acquire gil;
-    pyLogging.attr("info")(fmt::sprintf("%s: %s", buf, s));
+    pyLogging.attr("info")(s);
   }
 }
 
@@ -177,6 +180,7 @@ struct SharedMemory {
   size_t size = 1024 * 1024 * 100;
   std::byte* data = nullptr;
   std::string name;
+  bool unlinked = false;
   SharedMemory(std::string_view name) : name(name) {
     log("creating shm %s\n", name);
     fd = shm_open(std::string(name).c_str(), O_RDWR | O_CREAT, ACCESSPERMS);
@@ -192,7 +196,15 @@ struct SharedMemory {
   ~SharedMemory() {
     munmap(data, size);
     close(fd);
-    shm_unlink(name.c_str());
+    if (!unlinked) {
+      shm_unlink(name.c_str());
+    }
+  }
+  void unlink() {
+    if (!unlinked) {
+      shm_unlink(name.c_str());
+      unlinked = true;
+    }
   }
   template<typename T>
   T& as() {
@@ -351,7 +363,9 @@ struct BatchData {
 };
 
 constexpr size_t maxClients = 0x100;
-constexpr size_t maxEnvs = 0x1000;
+constexpr size_t maxEnvs = 0x400;
+
+constexpr int kInvalidAction = 0xffff;
 
 struct Shared {
   std::atomic_bool initialized;
@@ -382,17 +396,18 @@ struct Shared {
     };
 
     struct EnvInput {
-      int action = 0;
+      std::atomic<int> action = kInvalidAction;
     };
 
     size_t size = 0;
     size_t stride = 0;
 
     std::array<ClientInput, maxClients> clientInputs;
-    std::array<EnvInput, maxEnvs> envInputs;
+    std::array<EnvInput, maxEnvs> envInputs{};
     std::array<ClientOutput, maxClients> clientOutputs;
 
-    std::once_flag batchAllocated;
+    std::atomic_bool batchAllocated;
+    std::atomic_bool batchAllocating;
     BatchData batchData;
   };
 
@@ -439,12 +454,79 @@ struct Shared {
   }
 };
 
+struct BatchBuilderHelper {
+  std::unordered_map<std::string_view, bool> added;
+  struct I {
+    std::string key;
+    std::vector<int64_t> shape;
+    size_t elements;
+    size_t itemsize;
+    char dtype;
+  };
+  std::vector<I> fields;
+  void add(std::string_view key, size_t dims, const ssize_t* shape, size_t itemsize, char dtype) {
+    if (std::exchange(added[key], true)) {
+      throw std::runtime_error("key " + std::string(key) + " already exists in batch!");
+    }
+    size_t elements = 1;
+    for (size_t i = 0; i != dims; ++i) {
+      elements *= shape[i];
+    }
+    fields.emplace_back();
+    auto& f = fields.back();
+    f.key = key;
+    f.shape.assign(shape, shape + dims);
+    f.elements = elements;
+    f.itemsize = itemsize;
+    f.dtype = dtype;
+  }
+};
+
+torch::ScalarType getTensorDType(char dtype, int itemsize) {
+  switch (dtype) {
+  case 'f':
+    if (itemsize == 2) {
+      return torch::kFloat16;
+    } else if (itemsize == 4) {
+      return torch::kFloat32;
+    } else if (itemsize == 8) {
+      return torch::kFloat64;
+    } else {
+      throw std::runtime_error("Unexpected itemsize for float");
+    }
+    break;
+  case 'i':
+    if (itemsize == 1) {
+      return torch::kInt8;
+    } else if (itemsize == 2) {
+      return torch::kInt16;
+    } else if (itemsize == 4) {
+      return torch::kInt32;
+    } else if (itemsize == 8) {
+      return torch::kInt64;
+    } else throw std::runtime_error("Unexpected itemsize for int");
+    break;
+  case 'u':
+    if (itemsize == 1) {
+      return torch::kUInt8;
+    } else throw std::runtime_error("Unexpected itemsize for unsigned int");
+    break;
+  case 'b':
+    if (itemsize == 1) {
+      return torch::kBool;
+    } else throw std::runtime_error("Unexpected itemsize for boolean");
+    break;
+  default:
+    throw std::runtime_error("Unsupported dtype '" + std::string(1, dtype) + "'");
+  }
+}
+
 struct Env {
   py::object env_;
   py::object reset_;
   py::object step_;
 
-  int steps = 0;
+  uint64_t steps = 0;
   //std::string_view outbuffer;
 
   Env(py::object env) {
@@ -462,48 +544,27 @@ struct Env {
   }
 
   void allocateBatch(Shared* shared, BatchData& batch, const py::dict& obs) {
-    std::unordered_map<std::string_view, bool> added;
-    struct I {
-      std::string key;
-      std::vector<int64_t> shape;
-      size_t elements;
-      size_t itemsize;
-      char dtype;
-    };
-    std::vector<I> fields;
-    auto add = [&](std::string_view key, size_t dims, const ssize_t* shape, size_t itemsize, char dtype) {
-      if (std::exchange(added[key], true)) {
-        throw std::runtime_error("key " + std::string(key) + " already exists in batch!");
-      }
-      size_t elements = 1;
-      for (size_t i = 0; i != dims; ++i) {
-        elements *= shape[i];
-      }
-      fields.emplace_back();
-      auto& f = fields.back();
-      f.key = key;
-      f.shape.assign(shape, shape + dims);
-      f.elements = elements;
-      f.itemsize = itemsize;
-      f.dtype = dtype;
-    };
+
+    BatchBuilderHelper bb;
+
     for (auto& [key, value] : obs) {
       auto [str, stro] = pyStrView(key);
       py::array arr = py::reinterpret_borrow<py::object>(value);
-      add(str, arr.ndim(), arr.shape(), arr.itemsize(), arr.dtype().kind());
+      bb.add(str, arr.ndim(), arr.shape(), arr.itemsize(), arr.dtype().kind());
     }
-    std::array<ssize_t, 1> s{1};
-    add("done", 1, s.data(), 1, 'b');
-    add("reward", 1, s.data(), 4, 'f');
 
-    batch.data = shared->allocate<SharedMapEntry>(fields.size());
-    for (size_t i = 0; i != fields.size(); ++i) {
-      auto& f = fields[i];
+    std::array<ssize_t, 1> s{1};
+    bb.add("done", 1, s.data(), 1, 'b');
+    bb.add("reward", 1, s.data(), 4, 'f');
+
+    batch.data = shared->allocate<SharedMapEntry>(bb.fields.size());
+    for (size_t i = 0; i != bb.fields.size(); ++i) {
+      auto& f = bb.fields[i];
       auto& d = batch.data(shared, i);
       d.key = shared->allocateString(std::string_view(f.key));
     }
-    for (size_t i = 0; i != fields.size(); ++i) {
-      auto& f = fields[i];
+    for (size_t i = 0; i != bb.fields.size(); ++i) {
+      auto& f = bb.fields[i];
       auto& d = batch.data(shared, i);
       d.data = shared->allocateAligned<std::byte>(f.itemsize * f.elements * maxEnvs);
       d.shape = shared->allocate<int64_t>(f.shape.size());
@@ -535,9 +596,18 @@ struct Env {
   }
 
   void step(Shared* shared, size_t bufferIndex, size_t batchIndex) {
+    //log("step buffer %d index %d\n", bufferIndex, batchIndex);
     auto start = std::chrono::steady_clock::now();
     ++steps;
-    int action = std::uniform_int_distribution<size_t>(0, 10)(threadRng);
+    int action = kInvalidAction;
+    if (steps != 1) {
+      auto& sa = shared->buffers[bufferIndex].envInputs[batchIndex].action;
+      do {
+        action = sa.load(std::memory_order_acquire);
+      } while (action == kInvalidAction);
+      sa.store(kInvalidAction, std::memory_order_release);
+      //log("buffer %d index %d got action %d\n", bufferIndex, batchIndex, action);
+    }
     try {
       py::gil_scoped_acquire gil;
       bool done;
@@ -557,10 +627,16 @@ struct Env {
           obs = reset_();
         }
       }
-      auto& batch = shared->buffers[bufferIndex].batchData;
-      std::call_once(shared->buffers[bufferIndex].batchAllocated, [&]() {
-        allocateBatch(shared, batch, obs);
-      });
+      auto& buffer = shared->buffers[bufferIndex];
+      auto& batch = buffer.batchData;
+      if (!buffer.batchAllocated.load(std::memory_order_acquire)) {
+        if (buffer.batchAllocating.exchange(true)) {
+          while (!buffer.batchAllocated);
+        } else {
+          allocateBatch(shared, batch, obs);
+          buffer.batchAllocated = true;
+        }
+      }
       fillBatch(shared, batch, batchIndex, "done", &done, sizeof(bool));
       fillBatch(shared, batch, batchIndex, "reward", &reward, sizeof(float));
       for (auto& [key, value] : obs) {
@@ -640,6 +716,8 @@ struct LocalBuffer {
   std::vector<torch::Tensor> inputDevice;
   std::map<std::string, torch::Tensor> inputMap;
   std::vector<torch::Tensor> modelStates;
+  torch::Tensor actionPinned;
+  std::optional<c10::cuda::CUDAStream> cudaStream;
 };
 
 struct TestJob {
@@ -652,10 +730,12 @@ struct TestJob {
   SharedMemory shm{shmname};
   Shared* shared = &shm.as<Shared>();
 
+  int numClients_;
   py::object model_;
   std::string deviceStr_;
+  py::object learner_;
 
-  TestJob(py::object model, std::string deviceStr) : model_(std::move(model)), deviceStr_(deviceStr) {
+  TestJob(int numClients, py::object model, std::string deviceStr, py::object learner) : numClients_(numClients), model_(std::move(model)), deviceStr_(deviceStr), learner_(learner) {
   }
   ~TestJob() {
     terminate_ = true;
@@ -693,9 +773,11 @@ struct TestJob {
 
   void run() {
 
+    torch::Device device(deviceStr_);
+    bool isCuda = device.is_cuda();
     torch::NoGradGuard ng;
 
-    torch::Device device(deviceStr_);
+    log("isCuda: %d\n", isCuda);
 
     Timer t;
     int count = 0;
@@ -707,24 +789,44 @@ struct TestJob {
     local.resize(shared->buffers.size());
 
     async::SchedulerFifo asyncforward;
-    asyncforward.pool.maxThreads = shared->buffers.size();
+    asyncforward.pool.maxThreads = 1;
+
+    size_t nClients = 0;
+
+    while (shared->clients != numClients_) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    shm.unlink();
+
+    nClients = numClients_;
+
+    log("huh\n");
+    int batch_size;
+    int unroll_length;
+    {
+      py::gil_scoped_acquire gil;
+      batch_size = learner_.attr("batch_size").cast<int>();
+      unroll_length = learner_.attr("unroll_length").cast<int>();
+    }
+
+    log("Using an unroll length of %d and a batch size of %d\n", unroll_length, batch_size);
 
     while (!terminate_) {
-
-      if (shared->clients == 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        continue;
-      }
-
-      size_t nClients = shared->clients;
 
       if (nClients > maxClients) {
         throw std::runtime_error("Too many clients connected!");
       }
 
-      auto forwardBuffer = [&](size_t bufferIndex) {
+      auto doForwardBuffer = [&](size_t bufferIndex) {
         auto& buffer = shared->buffers[bufferIndex];
         auto& lbuf = local[bufferIndex];
+
+        std::optional<c10::cuda::CUDAStreamGuard> streamGuard;
+        if (isCuda) {
+          lbuf.cudaStream = c10::cuda::getStreamFromPool(false, device.index());
+          streamGuard.emplace(*lbuf.cudaStream);
+        }
 
         size_t size = buffer.size;
         size_t stride = buffer.stride;
@@ -750,44 +852,7 @@ struct TestJob {
           for (size_t i = 0; i != buffer.batchData.data.size; ++i) {
             auto key = src[i].key.view(shared);
             auto& v = src[i];
-            torch::TensorOptions opts;
-            switch (v.dtype) {
-            case 'f':
-              if (v.itemsize == 2) {
-                opts = opts.dtype(torch::kFloat16);
-              } else if (v.itemsize == 4) {
-                opts = opts.dtype(torch::kFloat32);
-              } else if (v.itemsize == 8) {
-                opts = opts.dtype(torch::kFloat64);
-              } else {
-                throw std::runtime_error("Unexpected itemsize for float");
-              }
-              break;
-            case 'i':
-              if (v.itemsize == 1) {
-                opts = opts.dtype(torch::kInt8);
-              } else if (v.itemsize == 2) {
-                opts = opts.dtype(torch::kInt16);
-              } else if (v.itemsize == 4) {
-                opts = opts.dtype(torch::kInt32);
-              } else if (v.itemsize == 8) {
-                opts = opts.dtype(torch::kInt64);
-              } else throw std::runtime_error("Unexpected itemsize for int");
-              break;
-            case 'u':
-              if (v.itemsize == 1) {
-                opts = opts.dtype(torch::kUInt8);
-              } else throw std::runtime_error("Unexpected itemsize for unsigned int");
-              break;
-            case 'b':
-              if (v.itemsize == 1) {
-                opts = opts.dtype(torch::kBool);
-              } else throw std::runtime_error("Unexpected itemsize for boolean");
-              break;
-            default:
-              throw std::runtime_error("Unsupported dtype '" + std::string(1, v.dtype) + "'");
-            }
-
+            torch::TensorOptions opts = getTensorDType(v.dtype, v.itemsize);
             std::vector<int64_t> sizes(v.shape(shared), v.shape(shared) + v.shape.size);
             sizes.insert(sizes.begin(), (int64_t)maxEnvs);
             map[std::string(key)] = torch::from_blob(v.data(shared), sizes, opts);
@@ -796,8 +861,10 @@ struct TestJob {
             //log("map [%s] sizes = %s\n", key, sizesStr(value.sizes()));
             lbuf.inputMap[key] = torch::Tensor();
             lbuf.inputShared.push_back(value);
-            lbuf.inputPinned.push_back(value.pin_memory());
-            lbuf.inputDevice.push_back(value.to(device));
+            if (isCuda) {
+              lbuf.inputPinned.push_back(value.pin_memory());
+              lbuf.inputDevice.push_back(value.to(device));
+            }
           }
         }
 //        auto& input = inputTmp;
@@ -809,50 +876,67 @@ struct TestJob {
 //          input[key] = n.to(device);
 //        }
         auto& input = lbuf.inputMap;
+        auto& ms = lbuf.modelStates;
         size_t index = 0;
         for (auto& [key, value] : input) {
           auto shared = lbuf.inputShared.at(index).narrow(0, 0, size);
-          auto pinned = lbuf.inputPinned.at(index).narrow(0, 0, size);
-          auto device = lbuf.inputDevice.at(index).narrow(0, 0, size);
-          pinned.copy_(shared);
-          device.copy_(pinned, true);
-          value = device;
-          if (key != "done") {
+          if (isCuda) {
+            auto device = lbuf.inputDevice.at(index).narrow(0, 0, size);
+            auto pinned = lbuf.inputPinned.at(index).narrow(0, 0, size);
+            pinned.copy_(shared);
+            if (!pinned.is_pinned()) {
+              throw std::runtime_error("pinned is not pinned!");
+            }
+            device.copy_(pinned, true);
+            value = device;
+          } else {
+            value = shared;
+          }
+          if (key != "done" && key != "reward") {
             value = value.unsqueeze(0);
           }
           ++index;
         }
-//        for (auto& [key, value] : input) {
-//          log("input [%s] sizes = %s\n", key, sizesStr(value.sizes()));
-//        }
-//        auto& state = stateTmp;
-//        state.resize(ms.size());
-//        for (size_t i = 0; i != state.size(); ++i) {
-//          if ((size_t)ms[i].size(1) != size) {
-//            throw std::runtime_error("model state size mismatch");
+//          for (auto& [key, value] : input) {
+//            log("input [%s] sizes = %s\n", key, sizesStr(value.sizes()));
 //          }
-//          state[i] = ms[i].narrow(1, 0, size);
-//          //log("state[%d].sum() is %g\n", i, state[i].sum().item<float>());
-//        }
-//        for (size_t i = 0; i != state.size(); ++i) {
-//          log("state [%d] sizes = {%s}\n", i, sizesStr(state[i].sizes()));
-//        }
-//        log("doing forward!\n");
-        py::gil_scoped_acquire gil;
-        py::tuple tup = model_(input, lbuf.modelStates);
-//        py::dict output = tup[0];
-//        py::tuple outstate = tup[1];
-//        for (size_t i = 0; i != ms.size(); ++i) {
-//          ms[i] = outstate[i].cast<torch::Tensor>();
-//        }
+        torch::Tensor action;
+        {
+          py::gil_scoped_acquire gil;
+          py::tuple tup = model_(input, ms, true);
+          py::dict output = tup[0];
+          py::tuple outstate = tup[1];
+          for (size_t i = 0; i != ms.size(); ++i) {
+            ms[i] = outstate[i].cast<torch::Tensor>();
+          }
+          action = output["action"].cast<torch::Tensor>();
+        }
+        if (action.dim() != 2 || action.size(0) != 1 || (size_t)action.size(1) != size) {
+          throw std::runtime_error("Expected action output of size {1, " + std::to_string(size) + "}, got " + sizesStr(action.sizes()));
+        }
+        auto& actionPinned = lbuf.actionPinned;
+        if (isCuda) {
+          if (!actionPinned.defined()) {
+            auto vec = action.sizes().vec();
+            vec.at(1) = maxEnvs;
+            actionPinned = torch::empty(vec, torch::TensorOptions(action.dtype()).pinned_memory(true));
+          }
+          if (!actionPinned.is_pinned()) {
+            throw std::runtime_error("actionPinned is not pinned!");
+          }
+          actionPinned.narrow(1, 0, size).copy_(action, true);
+        } else {
+          actionPinned = action;
+        }
       };
 
-      auto fillBuffer = [&](size_t bufferIndex) {
+      auto doFillBuffer = [&](size_t bufferIndex) {
         //buffer.remaining.store((size + stride - 1) / stride, std::memory_order_relaxed);
         auto& buffer = shared->buffers[bufferIndex];
-        auto& ms = local[bufferIndex].modelStates;
+        auto& lbuf = local[bufferIndex];
+        auto& ms = lbuf.modelStates;
 
-        size_t size = 256;
+        size_t size = 4;
 
         size_t strideDivisor = nClients;
         size_t stride = (size + strideDivisor - 1) / strideDivisor;
@@ -873,44 +957,49 @@ struct TestJob {
         buffer.size = size;
         buffer.stride = stride;
 
+        auto& action = lbuf.actionPinned;
+        std::optional<torch::TensorAccessor<long, 2>> acc;
+        bool hasAction = action.defined();
+        if (hasAction) {
+          if (isCuda) {
+            lbuf.cudaStream->synchronize();
+          }
+          if (action.scalar_type() != torch::kLong) {
+            std::cout << "action is " << action.dtype() << "\n";
+            throw std::runtime_error("model output action type mismatch");
+          }
+          acc = action.accessor<long, 2>();
+          if (acc->size(0) != 1 || (size_t)acc->size(1) != maxEnvs) {
+            log("size is %d, acc size is %s\n", size, sizesStr(acc->sizes()));
+            throw std::runtime_error("model output action size mismatch");
+          }
+        }
+
         size_t clientIndex = 0;
         for (size_t i = 0; i < size; i += stride, ++clientIndex) {
           int nSteps = std::min(size - i, stride);
-//          while (clientStates.size() <= clientIndex) {
-//            clientStates.emplace_back();
-//          }
-//          auto& cs = clientStates[clientIndex];
-//          while (cs.states.size() < (size_t)nSteps) {
-//            py::gil_scoped_acquire gil;
-//            cs.states.emplace_back();
-//            auto is = model_.attr("initial_state")();
-//            for (auto& v : is.cast<py::tuple>()) {
-//              log("its a tuple okay\n");
-//              log("its a %s\n", std::string(py::str(v.get_type())).c_str());
-//              cs.states.back().modelState.push_back(v.cast<torch::Tensor>());
-//            }
-//            //cs.states.back().modelState = .cast<std::vector<torch::Tensor>>();;
-//            log("got new initial state yey\n");
-//          }
           auto& input = buffer.clientInputs[clientIndex];
-//          auto& output = buffer.clientOutputs[clientIndex];
-//          //input.nSteps = nSteps;
-          size_t prevSteps = input.nStepsIn.load(std::memory_order_acquire);
-//          while (input.nStepsOut.load(std::memory_order_relaxed) != prevSteps && !terminate_) {
-//            _mm_pause();
-//          }
-          input.resultOffset.store(i, std::memory_order_relaxed);
-          input.nStepsIn.store(prevSteps + nSteps, std::memory_order_release);
+          if (hasAction) {
+            for (size_t s = i; s != i + nSteps; ++s) {
+              //log("setting action %d for buffer %d index %d\n", (*acc)[0][s], bufferIndex, s);
+              buffer.envInputs[s].action.store((*acc)[0][s], std::memory_order_relaxed);
+            }
+          }
+          input.resultOffset.store(i, std::memory_order_release);
+          input.nStepsIn.fetch_add(nSteps, std::memory_order_acq_rel);
         }
       };
 
 //      localBatch.step(stride);
 //      count += stride;
 
-      size_t bufferIndex = bufferCounter % shared->buffers.size();
-      auto& buffer = shared->buffers[bufferIndex];
-      forwardBuffer(bufferIndex);
-      fillBuffer(bufferIndex);
+      size_t forwardBufferIndex = (bufferCounter) % shared->buffers.size();
+      size_t fillBufferIndex = bufferCounter % shared->buffers.size();
+      auto& fillBuffer = shared->buffers[fillBufferIndex];
+      //log("forward %d\n", forwardBufferIndex);
+      doForwardBuffer(forwardBufferIndex);
+      //log("fill %d\n", fillBufferIndex);
+      doFillBuffer(fillBufferIndex);
       ++bufferCounter;
       //size_t currentIndex = bufferCounter % shared->buffers.size();
 
@@ -921,7 +1010,7 @@ struct TestJob {
         break;
       }
 
-      count += buffer.size;
+      count += fillBuffer.size;
 
       if (t.elapsed() >= 1.0f) {
         float tx = t.elapsedReset();
@@ -1004,8 +1093,9 @@ struct TestClient {
         ++bufferCounter;
         auto& input = buffer.clientInputs[myIndex];
         auto& output = buffer.clientOutputs[myIndex];
-        size_t stepsDone = output.nStepsOut.load(std::memory_order_relaxed);
+        size_t stepsDone = output.nStepsOut.load(std::memory_order_acquire);
         size_t nSteps = input.nStepsIn.load(std::memory_order_acquire);
+        //log("client %d waiting for work\n", myIndex);
         while (nSteps == stepsDone) {
           _mm_pause();
           nSteps = input.nStepsIn.load(std::memory_order_acquire);
@@ -1018,8 +1108,9 @@ struct TestClient {
         }
         size_t offset = input.resultOffset;
         //log("oh boy i got a task for %d steps\n", nSteps - stepsDone);
+        //log("client %d got work for buffer %d offset [%d, %d)\n", myIndex, bufferIndex, offset, offset + (nSteps - stepsDone));
         batch.at(bufferIndex).step(nSteps - stepsDone, &shared, bufferIndex, offset);
-        output.nStepsOut.store(nSteps, std::memory_order_relaxed);
+        output.nStepsOut.store(nSteps, std::memory_order_release);
 
 //        if (buffer.remaining.fetch_sub(1, std::memory_order_relaxed) == 1) {
 //          //shared->doneSem.post();
@@ -1039,7 +1130,7 @@ PYBIND11_MODULE(pyjob, m) {
     pyLogging = logging;
   });
   py::class_<TestJob>(m, "TestJob")
-      .def(py::init<py::object, std::string>())
+      .def(py::init<int, py::object, std::string, py::object>())
       .def("start", &TestJob::start)
       .def("get_name", &TestJob::getName);
   py::class_<TestClient>(m, "TestClient")
