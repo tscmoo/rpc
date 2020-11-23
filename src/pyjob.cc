@@ -40,7 +40,7 @@ std::mutex logMutex;
 template<typename... Args>
 void log(const char* fmt, Args&&... args) {
   std::lock_guard l(logMutex);
-  if (pyLogging.is_none()) {
+  if (true || pyLogging.is_none()) {
     time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     auto* tm = std::localtime(&now);
     char buf[0x40];
@@ -412,7 +412,7 @@ struct Shared {
   };
 
   alignas(64) std::atomic_int clients = 0;
-  std::array<Buffer, 2> buffers;
+  std::array<Buffer, 4> buffers;
 
 
   std::byte* allocateNonAligned(size_t n) {
@@ -529,6 +529,9 @@ struct Env {
   uint64_t steps = 0;
   //std::string_view outbuffer;
 
+  uint32_t episodeStep = 0;
+  float episodeReturn = 0;
+
   Env(py::object env) {
     py::gil_scoped_acquire gil;
     env_ = std::move(env);
@@ -555,7 +558,9 @@ struct Env {
 
     std::array<ssize_t, 1> s{1};
     bb.add("done", 1, s.data(), 1, 'b');
-    bb.add("reward", 1, s.data(), 4, 'f');
+    bb.add("rewards", 1, s.data(), 4, 'f');
+    bb.add("episode_step", 1, s.data(), 4, 'i');
+    bb.add("episode_return", 1, s.data(), 4, 'f');
 
     batch.data = shared->allocate<SharedMapEntry>(bb.fields.size());
     for (size_t i = 0; i != bb.fields.size(); ++i) {
@@ -613,6 +618,8 @@ struct Env {
       bool done;
       float reward;
       py::dict obs;
+      float localEpisodeReturn = episodeReturn;
+      uint32_t localEpisodeStep = episodeStep;
       if (steps == 1) {
         done = false;
         reward = 0.0f;
@@ -623,8 +630,12 @@ struct Env {
         obs = tup[0];
         reward = (py::float_)tup[1];
         done = (py::bool_)tup[2];
+        localEpisodeReturn = episodeReturn += reward;
+        localEpisodeStep = ++episodeStep;
         if (done) {
           obs = reset_();
+          episodeStep = 0;
+          episodeReturn = 0;
         }
       }
       auto& buffer = shared->buffers[bufferIndex];
@@ -638,7 +649,9 @@ struct Env {
         }
       }
       fillBatch(shared, batch, batchIndex, "done", &done, sizeof(bool));
-      fillBatch(shared, batch, batchIndex, "reward", &reward, sizeof(float));
+      fillBatch(shared, batch, batchIndex, "rewards", &reward, sizeof(float));
+      fillBatch(shared, batch, batchIndex, "episode_step", &localEpisodeStep, sizeof(uint32_t));
+      fillBatch(shared, batch, batchIndex, "episode_return", &localEpisodeReturn, sizeof(float));
       for (auto& [key, value] : obs) {
         auto [str, stro] = pyStrView(key);
         py::array arr(py::reinterpret_borrow<py::array>(value));
@@ -713,11 +726,17 @@ struct EnvBatch {
 struct LocalBuffer {
   std::vector<torch::Tensor> inputShared;
   std::vector<torch::Tensor> inputPinned;
-  std::vector<torch::Tensor> inputDevice;
-  std::map<std::string, torch::Tensor> inputMap;
   std::vector<torch::Tensor> modelStates;
   torch::Tensor actionPinned;
   std::optional<c10::cuda::CUDAStream> cudaStream;
+
+  std::map<std::string, torch::Tensor> inputMap;
+  std::map<std::string, torch::Tensor> outputMap;
+
+  std::vector<torch::Tensor> inputDeviceSeq;
+  std::vector<torch::Tensor> outputDeviceSeq;
+
+  size_t currentSequenceIndex = 0;
 };
 
 struct TestJob {
@@ -735,7 +754,7 @@ struct TestJob {
   std::string deviceStr_;
   py::object learner_;
 
-  TestJob(int numClients, py::object model, std::string deviceStr, py::object learner) : numClients_(numClients), model_(std::move(model)), deviceStr_(deviceStr), learner_(learner) {
+  TestJob() {
   }
   ~TestJob() {
     terminate_ = true;
@@ -744,7 +763,11 @@ struct TestJob {
     runThread.join();
   }
 
-  void start() {
+  void start(int numClients, py::object model, std::string deviceStr, py::object learner) {
+    numClients_ = numClients;
+    model_ = model;
+    deviceStr_ = deviceStr;
+    learner_ = learner;
     runThread = std::thread([this]() {
       run();
     });
@@ -795,22 +818,29 @@ struct TestJob {
 
     while (shared->clients != numClients_) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      if (terminate_) {
+        return;
+      }
     }
 
     shm.unlink();
 
     nClients = numClients_;
 
-    log("huh\n");
-    int batch_size;
-    int unroll_length;
+    int batchSize;
+    int unrollLength;
     {
       py::gil_scoped_acquire gil;
-      batch_size = learner_.attr("batch_size").cast<int>();
-      unroll_length = learner_.attr("unroll_length").cast<int>();
+      batchSize = learner_.attr("batch_size").cast<int>();
+      unrollLength = learner_.attr("unroll_length").cast<int>();
     }
 
-    log("Using an unroll length of %d and a batch size of %d\n", unroll_length, batch_size);
+    log("Using an unroll length of %d and a batch size of %d\n", unrollLength, batchSize);
+
+    Timer mainTimer;
+    float pythonTime = 0.0f;
+    float waitTime = 0.0f;
+    float syncTime = 0.0f;
 
     while (!terminate_) {
 
@@ -839,12 +869,14 @@ struct TestJob {
 //          if (clientStates.size() <= clientIndex || clientStates[clientIndex].states.size() < nSteps) {
 //            throw std::runtime_error("clientStates mismatch");
 //          }
+          Timer t;
           auto& input = buffer.clientInputs[clientIndex];
           auto& output = buffer.clientOutputs[clientIndex];
           size_t prevSteps = input.nStepsIn.load(std::memory_order_acquire);
           while (output.nStepsOut.load(std::memory_order_relaxed) != prevSteps && !terminate_) {
             _mm_pause();
           }
+          waitTime += t.elapsed();
         }
         if (lbuf.inputMap.empty()) {
           std::map<std::string, torch::Tensor> map;
@@ -858,13 +890,18 @@ struct TestJob {
             map[std::string(key)] = torch::from_blob(v.data(shared), sizes, opts);
           }
           for (auto& [key, value] : map) {
-            //log("map [%s] sizes = %s\n", key, sizesStr(value.sizes()));
+            log("map [%s] sizes = %s\n", key, sizesStr(value.sizes()));
             lbuf.inputMap[key] = torch::Tensor();
             lbuf.inputShared.push_back(value);
             if (isCuda) {
               lbuf.inputPinned.push_back(value.pin_memory());
-              lbuf.inputDevice.push_back(value.to(device));
             }
+
+            auto opts = torch::TensorOptions(value.dtype()).device(device);
+            std::vector<int64_t> sizes = value.sizes().vec();
+            sizes.at(0) = batchSize;
+            sizes.insert(sizes.begin(), (int64_t)unrollLength);
+            lbuf.inputDeviceSeq.push_back(torch::empty(sizes,  opts));
           }
         }
 //        auto& input = inputTmp;
@@ -879,29 +916,30 @@ struct TestJob {
         auto& ms = lbuf.modelStates;
         size_t index = 0;
         for (auto& [key, value] : input) {
+          auto device = lbuf.inputDeviceSeq.at(index).select(0, lbuf.currentSequenceIndex).narrow(0, 0, size);
+          value = device;
           auto shared = lbuf.inputShared.at(index).narrow(0, 0, size);
           if (isCuda) {
-            auto device = lbuf.inputDevice.at(index).narrow(0, 0, size);
             auto pinned = lbuf.inputPinned.at(index).narrow(0, 0, size);
-            pinned.copy_(shared);
+            pinned.copy_(shared, true);
             if (!pinned.is_pinned()) {
               throw std::runtime_error("pinned is not pinned!");
             }
-            device.copy_(pinned, true);
-            value = device;
+            value.copy_(pinned, true);
           } else {
-            value = shared;
+            value.copy_(shared);
           }
-          if (key != "done" && key != "reward") {
-            value = value.unsqueeze(0);
-          }
+          value = value.unsqueeze(0);
           ++index;
         }
 //          for (auto& [key, value] : input) {
 //            log("input [%s] sizes = %s\n", key, sizesStr(value.sizes()));
 //          }
         torch::Tensor action;
+        std::map<std::string, torch::Tensor> outputMap;
         {
+          torch::AutoGradMode grad(true);
+          Timer t;
           py::gil_scoped_acquire gil;
           py::tuple tup = model_(input, ms, true);
           py::dict output = tup[0];
@@ -909,8 +947,11 @@ struct TestJob {
           for (size_t i = 0; i != ms.size(); ++i) {
             ms[i] = outstate[i].cast<torch::Tensor>();
           }
-          action = output["action"].cast<torch::Tensor>();
+          outputMap = output.cast<std::map<std::string, torch::Tensor>>();
+
+          pythonTime += t.elapsed();
         }
+        action = outputMap["action"];
         if (action.dim() != 2 || action.size(0) != 1 || (size_t)action.size(1) != size) {
           throw std::runtime_error("Expected action output of size {1, " + std::to_string(size) + "}, got " + sizesStr(action.sizes()));
         }
@@ -928,6 +969,83 @@ struct TestJob {
         } else {
           actionPinned = action;
         }
+        if (lbuf.outputMap.empty()) {
+          lbuf.outputMap = outputMap;
+          for (auto& [key, value] : outputMap) {
+            auto sizes = value.sizes().vec();
+            if (sizes.size() < 2) {
+              throw std::runtime_error("Model output has not enough dimensions");
+            }
+            sizes.at(0) = unrollLength;
+            sizes.at(1) = batchSize;
+            auto opts = torch::TensorOptions(value.dtype()).device(device);
+            lbuf.outputDeviceSeq.push_back(torch::empty(sizes, opts));
+
+            log("new output device seq [%s] = %s\n", key, sizesStr(sizes));
+          }
+        } else if (lbuf.outputMap.size() != outputMap.size()) {
+          throw std::runtime_error("Inconsistent model output dict");
+        }
+
+        torch::AutoGradMode grad(true);
+        index = 0;
+        for (auto& [key, value] : outputMap) {
+          if (value.size(0) != 1) {
+            throw std::runtime_error("Expected size 1 in first dimension, got " + sizesStr(value.sizes()));
+          }
+          lbuf.outputDeviceSeq[index].select(0, lbuf.currentSequenceIndex).copy_(value.select(0, 0), true);
+          ++index;
+        }
+        if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
+          log("Stepping buffer %d\n", bufferIndex);
+          index = 0;
+          for (auto& [key, value] : input) {
+            //log("input [%s] = %s\n", key, sizesStr(value.sizes()));
+            value = lbuf.inputDeviceSeq.at(index);
+            ++index;
+          }
+          index = 0;
+          //log("lbuf.outputDeviceSeq.size() is %d\n", lbuf.outputDeviceSeq.size());
+          for (auto& [key, value] : outputMap) {
+            //log("output [%s] = %s\n", key, sizesStr(value.sizes()));
+            value = lbuf.outputDeviceSeq.at(index);
+            ++index;
+          }
+          //auto msStack = torch::stack(ms);
+          {
+            //py::gil_scoped_acquire gil;
+            //learner_.attr("step")(input, outputMap);
+          }
+          lbuf.currentSequenceIndex = 0;
+
+          for (auto& v : ms) {
+            v.detach_();
+          }
+          for (auto& v : lbuf.inputDeviceSeq) {
+            v.detach_();
+          }
+          for (auto& v : lbuf.outputDeviceSeq) {
+            v.detach_();
+          }
+
+          log("Buffer %d stepped\n", bufferIndex);
+
+          if (bufferIndex == shared->buffers.size() - 1) {
+            log("Stepping optimizer\n");
+            {
+              //py::gil_scoped_acquire gil;
+              //learner_.attr("step_optimizer")();
+            }
+          }
+
+          float tt = mainTimer.elapsed();
+          auto ts = [&](float v) {
+            return fmt::sprintf("%g (%g%%)", v, v * 100 / tt);
+          };
+          log("total time: %g, python: %s wait: %s sync: %s\n", tt, ts(pythonTime), ts(waitTime), ts(syncTime));
+        } else {
+          ++lbuf.currentSequenceIndex;
+        }
       };
 
       auto doFillBuffer = [&](size_t bufferIndex) {
@@ -936,7 +1054,7 @@ struct TestJob {
         auto& lbuf = local[bufferIndex];
         auto& ms = lbuf.modelStates;
 
-        size_t size = 4;
+        size_t size = batchSize;
 
         size_t strideDivisor = nClients;
         size_t stride = (size + strideDivisor - 1) / strideDivisor;
@@ -962,7 +1080,9 @@ struct TestJob {
         bool hasAction = action.defined();
         if (hasAction) {
           if (isCuda) {
+            Timer t;
             lbuf.cudaStream->synchronize();
+            syncTime += t.elapsed();
           }
           if (action.scalar_type() != torch::kLong) {
             std::cout << "action is " << action.dtype() << "\n";
@@ -1087,6 +1207,8 @@ struct TestClient {
 
       size_t bufferCounter = 0;
 
+      auto lastUpdate = std::chrono::steady_clock::now();
+
       while (true) {
         size_t bufferIndex = bufferCounter % shared.buffers.size();
         auto& buffer = shared.buffers[bufferIndex];
@@ -1096,16 +1218,27 @@ struct TestClient {
         size_t stepsDone = output.nStepsOut.load(std::memory_order_acquire);
         size_t nSteps = input.nStepsIn.load(std::memory_order_acquire);
         //log("client %d waiting for work\n", myIndex);
+        uint32_t timeCheckCounter = 0x10000;
         while (nSteps == stepsDone) {
           _mm_pause();
           nSteps = input.nStepsIn.load(std::memory_order_acquire);
           if (terminate_.load(std::memory_order_relaxed)) {
             break;
           }
+          if (--timeCheckCounter == 0) {
+            timeCheckCounter = 0x10000;
+            auto now = std::chrono::steady_clock::now();
+            if (now - lastUpdate >= std::chrono::seconds(4)) {
+              log("Client timed out\n");
+              terminate_ = true;
+              break;
+            }
+          }
         }
         if (terminate_.load(std::memory_order_relaxed)) {
           break;
         }
+        lastUpdate = std::chrono::steady_clock::now();
         size_t offset = input.resultOffset;
         //log("oh boy i got a task for %d steps\n", nSteps - stepsDone);
         //log("client %d got work for buffer %d offset [%d, %d)\n", myIndex, bufferIndex, offset, offset + (nSteps - stepsDone));
@@ -1116,6 +1249,7 @@ struct TestClient {
 //          //shared->doneSem.post();
 //        }
       }
+      running_ = false;
     } catch (...) {
       running_ = false;
       throw;
@@ -1130,7 +1264,7 @@ PYBIND11_MODULE(pyjob, m) {
     pyLogging = logging;
   });
   py::class_<TestJob>(m, "TestJob")
-      .def(py::init<int, py::object, std::string, py::object>())
+      .def(py::init<>())
       .def("start", &TestJob::start)
       .def("get_name", &TestJob::getName);
   py::class_<TestClient>(m, "TestClient")
