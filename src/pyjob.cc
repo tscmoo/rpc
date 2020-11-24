@@ -928,6 +928,11 @@ struct TestJob {
 
           return;
         }
+        if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
+          for (auto& v : local) {
+            while (v.busy);
+          }
+        }
         lbuf.busy = true;
         for (size_t i = 0; i < size; i += stride, ++clientIndex) {
 //          int nSteps = std::min(size - i, stride);
@@ -987,6 +992,10 @@ struct TestJob {
             streamGuard.emplace(*lbuf.cudaStream);
           }
 
+          std::lock_guard lm(modelMutex);
+
+          torch::AutoGradMode ng(false);
+
           //std::lock_guard l(modelMutex);
 
           Profile pprepare("prepare");
@@ -1032,12 +1041,15 @@ struct TestJob {
 
           pprepare.stop();
 
+          //std::lock_guard lm(modelMutex);
+
           torch::Tensor action;
           std::map<std::string, torch::Tensor> outputMap;
           {
             torch::AutoGradMode grad(true);
             Profile p("python model forward");
             py::gil_scoped_acquire gil;
+            //log("model forward %d\n", bufferIndex);
             py::tuple tup = model_(input, ms, true);
             py::dict output = tup[0];
             py::tuple outstate = tup[1];
@@ -1045,6 +1057,8 @@ struct TestJob {
               ms[i] = outstate[i].cast<torch::Tensor>();
             }
             outputMap = output.cast<std::map<std::string, torch::Tensor>>();
+
+            //log("model forward %d done\n", bufferIndex);
           }
           Profile paction("action");
           action = outputMap["action"];
@@ -1118,6 +1132,7 @@ struct TestJob {
           });
           if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
             Profile p("step");
+            //std::lock_guard lm(modelMutex);
             torch::GradMode::set_enabled(true);
             //log("Stepping buffer %d\n", bufferIndex);
             index = 0;
@@ -1137,7 +1152,9 @@ struct TestJob {
             {
               Profile p("python step");
               py::gil_scoped_acquire gil;
+              //log("step %d\n", bufferIndex);
               learner_.attr("step")(input, outputMap);
+              //log("step %d done\n", bufferIndex);
             }
             lbuf.currentSequenceIndex = 0;
 
@@ -1163,32 +1180,37 @@ struct TestJob {
               }
               {
                 py::gil_scoped_acquire gil;
+                //log("optimizer %d\n", bufferIndex);
                 learner_.attr("step_optimizer")();
+                //log("optimizer %d done \n", bufferIndex);
               }
             }
 
             p.stop();
 
-            float tt = mainTimer.elapsed();
-            auto ts = [&](float v) {
-              return fmt::sprintf("%g (%g%%)", v, v * 100 / tt);
-            };
-            std::string s;
-            std::lock_guard l(profileMutex);
-            for (auto& [key, value] : profileTimes) {
-              if (!s.empty()) {
-                s += " ";
-              }
-              s += key;
-              s += ": ";
-              s += ts(value);
-            }
-            log("total time: %g, %s\n", tt, s);
+//            float tt = mainTimer.elapsed();
+//            auto ts = [&](float v) {
+//              return fmt::sprintf("%g (%g%%)", v, v * 100 / tt);
+//            };
+//            std::string s;
+//            std::lock_guard l(profileMutex);
+//            for (auto& [key, value] : profileTimes) {
+//              if (!s.empty()) {
+//                s += " ";
+//              }
+//              s += key;
+//              s += ": ";
+//              s += ts(value);
+//            }
+//            log("total time: %g, %s\n", tt, s);
           } else {
             ++lbuf.currentSequenceIndex;
           }
           lbuf.busy = false;
         });
+        if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
+          while (lbuf.busy);
+        }
       };
 
       size_t forwardBufferIndex = (bufferCounter) % shared->buffers.size();
@@ -1205,7 +1227,7 @@ struct TestJob {
         float tx = t.elapsedReset();
         int n = count;
         count = 0;
-        log("rate %g/s\n", n / tx);
+        //log("rate %g/s\n", n / tx);
       }
     }
 
@@ -1297,7 +1319,7 @@ struct TestClient {
           if (--timeCheckCounter == 0) {
             timeCheckCounter = 0x10000;
             auto now = std::chrono::steady_clock::now();
-            if (now - lastUpdate >= std::chrono::seconds(4)) {
+            if (now - lastUpdate >= std::chrono::seconds(600)) {
               log("Client timed out\n");
               terminate_ = true;
               break;
