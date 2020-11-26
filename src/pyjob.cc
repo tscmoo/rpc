@@ -40,7 +40,7 @@ std::mutex logMutex;
 template<typename... Args>
 void log(const char* fmt, Args&&... args) {
   std::lock_guard l(logMutex);
-  if (true || pyLogging.is_none()) {
+  if (pyLogging.is_none()) {
     time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     auto* tm = std::localtime(&now);
     char buf[0x40];
@@ -276,6 +276,11 @@ std::atomic_int resetCount = 0;
 std::atomic_int namecounter = 0;
 
 std::atomic_int lastcount = 0;
+
+template<typename Duration>
+float seconds(Duration duration) {
+  return std::chrono::duration_cast<std::chrono::duration<float, std::ratio<1, 1>>>(duration).count();
+}
 
 struct Timer {
   std::chrono::steady_clock::time_point start;
@@ -764,6 +769,56 @@ struct Profile {
   }
 };
 
+template<typename T>
+struct Future {
+private:
+  using IT = std::conditional_t<std::is_same_v<T, void>, std::nullptr_t, T>;
+  struct S {
+    std::optional<IT> value;
+    std::atomic_bool hasValue = false;
+  };
+  std::shared_ptr<S> s;
+public:
+  Future() {
+    s = std::make_shared<S>();
+  }
+  void set() {
+    s->value.emplace();
+    s->hasValue = true;
+  }
+  template<typename T2>
+  void set(T2&& val) {
+    s->value = std::move(val);
+    s->hasValue = true;
+  }
+  operator bool() const noexcept {
+    return s->hasValue;
+  }
+  IT& operator*() {
+    return *s->value;
+  }
+  IT* operator->() {
+    return &*s->value;
+  }
+};
+
+template<typename T, typename... Args>
+Future<T> callImpl(rpc::Rpc& rpc, std::string_view peerName, std::string_view funcName, Args&&... args) {
+  Future<T> retval;
+  rpc.asyncCallback<T>(peerName, funcName, [retval](T* value, rpc::Error* err) mutable {
+    if (value) {
+      if constexpr (!std::is_same_v<T, void>) {
+        retval.set(*value);
+      } else {
+        retval.set();
+      }
+    } else {
+      log("RPC error: %s\n", err->what());
+    }
+  }, std::forward<Args>(args)...);
+  return retval;
+}
+
 struct TestJob {
 
   std::thread runThread;
@@ -779,11 +834,146 @@ struct TestJob {
   std::string deviceStr_;
   py::object learner_;
 
-  TestJob() {
+  std::optional<rpc::Rpc> rpc;
+
+  Future<void> pingFuture;
+  bool hasPinged = false;
+  std::string groupName_;
+
+  uint32_t numUpdates_ = 0;
+  std::string syncMaster;
+
+  std::mutex syncMutex;
+  uint32_t syncId_ = -1;
+  std::vector<std::string> members_;
+
+  bool haveNewParameters = false;
+  uint32_t newNumUpdates = 0;
+  std::vector<torch::Tensor> newParameters;
+  std::vector<torch::Tensor> newBuffers;
+
+  size_t numSyncedGradients = 0;
+  std::vector<torch::Tensor> syncedGrads;
+
+  std::string myName;
+  std::vector<torch::Tensor> modelParameters;
+  std::vector<torch::Tensor> modelBuffers;
+
+  bool gradMode = false;
+
+  template<typename T, typename... Args>
+  Future<T> call(std::string_view peerName, std::string_view funcName, Args&&... args) {
+    return callImpl<T>(*rpc, peerName, funcName, std::forward<Args>(args)...);
+  }
+
+  TestJob(std::string brokerAddress, std::string groupName) : groupName_(groupName) {
+    if (!brokerAddress.empty() && !groupName.empty()) {
+      rpc.emplace();
+
+      myName = rpc->getName();
+
+      rpc->define<uint32_t(std::string_view, uint32_t)>("sync", [this](std::string_view group, uint32_t syncId) {
+        std::lock_guard l(syncMutex);
+        if (group == groupName_) {
+          syncId_ = syncId;
+          log("synced with id %#x\n", syncId);
+          return syncId;
+        } else {
+          return (uint32_t)-1;
+        }
+      });
+
+      rpc->define<std::string_view(std::string_view, std::vector<std::string>)>("update", [this](std::string_view group, std::vector<std::string> members) {
+        std::lock_guard l(syncMutex);
+        if (group == groupName_ && !members.empty()) {
+          std::string s = "{";
+          for (auto& v : members) {
+            if (s.size() != 1) {
+              s += ", ";
+            }
+            s += v;
+          }
+          s += "}";
+          log("group %s update members %s\n", group, s);
+          members_ = std::move(members);
+          return members_.front();
+        } else {
+          return std::string();
+        }
+      });
+
+      rpc->define<bool(std::string_view, uint32_t, uint32_t, std::vector<torch::Tensor>)>("grads", [this](std::string_view group, uint32_t syncId, uint32_t numUpdates, std::vector<torch::Tensor> grads) {
+        std::lock_guard l(syncMutex);
+        if (syncMaster != myName) {
+          log("Got grads but I am not the master!\n");
+          return false;
+        }
+        if (group != groupName_) {
+          log("Got grads for wrong group %s\n", group);
+          return false;
+        }
+        if (syncId != syncId_) {
+          log("Got grads for wrong syncId (%#x, should be %#x)\n", syncId, syncId_);
+          return false;
+        }
+        if (grads.size() != syncedGrads.size()) {
+          log("Got grads for wrong number of grads (%d, should be %d)\n", grads.size(), syncedGrads.size());
+          return false;
+        }
+        log("Recv grads %#x %#x\n", syncId, numUpdates);
+        if (numUpdates_ - numUpdates <= 1) {
+          ++numSyncedGradients;
+          for (size_t i = 0; i != grads.size(); ++i) {
+            syncedGrads[i].add_(grads[i]);
+          }
+          return true;
+        } else {
+          log("Ignoring grads as they are too old (age %d)\n", numUpdates_ - numUpdates);
+          return false;
+        }
+      });
+
+      rpc->define<bool(std::string_view, uint32_t, uint32_t, std::vector<torch::Tensor>, std::vector<torch::Tensor>)>("modelUpdate", [this](std::string_view group, uint32_t syncId, uint32_t numUpdates, std::vector<torch::Tensor> parameters, std::vector<torch::Tensor> buffers) {
+        std::lock_guard l(syncMutex);
+        if (group != groupName_) {
+          log("Got model update for wrong group %s\n", group);
+          return false;
+        }
+        if (syncId != syncId_) {
+          log("Got model update for wrong syncId (%#x, should be %#x)\n", syncId, syncId_);
+          return false;
+        }
+        if (parameters.size() != modelParameters.size()) {
+          log("Got model update for wrong number of parameters (%d, should be %d)\n", parameters.size(), modelParameters.size());
+          return false;
+        }
+        if (buffers.size() != modelBuffers.size()) {
+          log("Got model update for wrong number of parameters (%d, should be %d)\n", buffers.size(), modelBuffers.size());
+          return false;
+        }
+        log("got modelUpdate %d\n", numUpdates);
+        haveNewParameters = true;
+        newNumUpdates = numUpdates;
+        newParameters = std::move(parameters);
+        newBuffers = std::move(buffers);
+        return true;
+      });
+
+      log("My name is %s, connecting to broker at %s\n", myName, brokerAddress);
+      rpc->connect(brokerAddress);
+      auto fut = rpc->async<size_t>("broker", "groupSize", groupName);
+      if (fut.wait_for(std::chrono::seconds(60)) != std::future_status::ready) {
+        throw std::runtime_error("Timed out connecting to broker at " + brokerAddress);
+      }
+      size_t n = fut.get();
+      log("Group %s has %d existing members\n", groupName, n);
+    }
   }
   ~TestJob() {
     terminate_ = true;
     //shared->doneSem.post();
+    //log("Note: Hackily quick-exiting\n");
+    std::quick_exit(1);
     py::gil_scoped_release gil;
     runThread.join();
   }
@@ -819,6 +1009,13 @@ struct TestJob {
     return s;
   }
 
+  struct ModelUpdateTracker {
+    std::optional<Future<bool>> future;
+    std::chrono::steady_clock::time_point timestamp;
+  };
+
+  std::unordered_map<std::string, ModelUpdateTracker> modelUpdateTracker;
+
   void run() {
 
     torch::Device device(deviceStr_);
@@ -842,9 +1039,15 @@ struct TestJob {
     async::SchedulerFifo asyncAction;
     asyncAction.pool.maxThreads = 2;
 
+    async::SchedulerFifo asyncSync;
+
     std::mutex modelMutex;
 
     size_t nClients = 0;
+
+    std::optional<Future<bool>> gradFuture;
+    std::chrono::steady_clock::time_point gradTimestamp;
+    int masterLagCount = 0;
 
     while (shared->clients != numClients_) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -866,6 +1069,24 @@ struct TestJob {
     }
 
     log("Using an unroll length of %d and a batch size of %d\n", unrollLength, batchSize);
+
+    {
+      py::gil_scoped_acquire gil;
+      size_t numelp = 0;
+      size_t numelb = 0;
+      for (py::handle h : model_.attr("parameters")()) {
+        auto t = h.cast<torch::Tensor>();
+        numelp += t.numel();
+        modelParameters.push_back(std::move(t));
+      }
+      for (py::handle h : model_.attr("buffers")()) {
+        auto t = h.cast<torch::Tensor>();
+        numelb += t.numel();
+        modelBuffers.push_back(std::move(t));
+      }
+      log("Model has %d parameters across %d tensors\n", numelp, modelParameters.size());
+      log("Model has %d buffers across %d tensors\n", numelb, modelBuffers.size());
+    }
 
     Timer mainTimer;
 
@@ -933,6 +1154,7 @@ struct TestJob {
             while (v.busy);
           }
         }
+        auto start = std::chrono::steady_clock::now();
         lbuf.busy = true;
         for (size_t i = 0; i < size; i += stride, ++clientIndex) {
 //          int nSteps = std::min(size - i, stride);
@@ -943,8 +1165,22 @@ struct TestJob {
           auto& input = buffer.clientInputs[clientIndex];
           auto& output = buffer.clientOutputs[clientIndex];
           size_t prevSteps = input.nStepsIn.load(std::memory_order_acquire);
+          uint32_t timeCheckCounter = 0x10000;
           while (output.nStepsOut.load(std::memory_order_relaxed) != prevSteps && !terminate_) {
             _mm_pause();
+
+            if (--timeCheckCounter == 0) {
+              timeCheckCounter = 0x10000;
+              auto now = std::chrono::steady_clock::now();
+              if (now - start >= std::chrono::seconds(600)) {
+                log("Timed out waiting for clients\n");
+                std::exit(1);
+                break;
+              }
+            }
+          }
+          if (terminate_) {
+            return;
           }
         }
         if (lbuf.inputMap.empty()) {
@@ -1046,11 +1282,23 @@ struct TestJob {
           torch::Tensor action;
           std::map<std::string, torch::Tensor> outputMap;
           {
-            torch::AutoGradMode grad(true);
+            torch::AutoGradMode grad(gradMode);
             Profile p("python model forward");
             py::gil_scoped_acquire gil;
             //log("model forward %d\n", bufferIndex);
             py::tuple tup = model_(input, ms, true);
+//            while (true) {
+//              tup = model_(input, ms, true);
+
+//              count += batchSize;
+
+//              if (t.elapsed() >= 1.0f) {
+//                float tx = t.elapsedReset();
+//                int n = count;
+//                count = 0;
+//                log("rate %g/s\n", n / tx);
+//              }
+//            }
             py::dict output = tup[0];
             py::tuple outstate = tup[1];
             for (size_t i = 0; i != ms.size(); ++i) {
@@ -1099,7 +1347,7 @@ struct TestJob {
           }
 
           Profile poutput("output");
-          torch::GradMode::set_enabled(true);
+          torch::GradMode::set_enabled(gradMode);
           index = 0;
           for (auto& [key, value] : outputMap) {
             if (value.size(0) != 1) {
@@ -1121,7 +1369,7 @@ struct TestJob {
               throw std::runtime_error("model output action type mismatch");
             }
             auto acc = action.accessor<long, 2>();
-            if (acc.size(0) != 1 || (size_t)acc.size(1) != maxEnvs) {
+            if (acc.size(0) != 1 || (size_t)acc.size(1) < size) {
               log("size is %d, acc size is %s\n", size, sizesStr(acc.sizes()));
               throw std::runtime_error("model output action size mismatch");
             }
@@ -1130,81 +1378,265 @@ struct TestJob {
               //buffer.envInputs[i].action.store(10, std::memory_order_relaxed);
             }
           });
-          if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
-            Profile p("step");
-            //std::lock_guard lm(modelMutex);
-            torch::GradMode::set_enabled(true);
-            //log("Stepping buffer %d\n", bufferIndex);
-            index = 0;
-            for (auto& [key, value] : input) {
-              //log("input [%s] = %s\n", key, sizesStr(value.sizes()));
-              value = lbuf.inputDeviceSeq.at(index);
-              ++index;
+          if (gradMode == false) {
+            if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
+              lbuf.currentSequenceIndex = 0;
+            } else {
+              ++lbuf.currentSequenceIndex;
             }
-            index = 0;
-            //log("lbuf.outputDeviceSeq.size() is %d\n", lbuf.outputDeviceSeq.size());
-            for (auto& [key, value] : outputMap) {
-              //log("output [%s] = %s\n", key, sizesStr(value.sizes()));
-              value = lbuf.outputDeviceSeq.at(index);
-              ++index;
-            }
-            //auto msStack = torch::stack(ms);
-            {
-              Profile p("python step");
-              py::gil_scoped_acquire gil;
-              //log("step %d\n", bufferIndex);
-              learner_.attr("step")(input, outputMap);
-              //log("step %d done\n", bufferIndex);
-            }
-            lbuf.currentSequenceIndex = 0;
-
-            for (auto& v : ms) {
-              v.detach_();
-            }
-            for (auto& v : lbuf.inputDeviceSeq) {
-              v.detach_();
-            }
-            for (auto& v : lbuf.outputDeviceSeq) {
-              v.detach_();
-            }
-
-            //log("Buffer %d stepped\n", bufferIndex);
-
-            int stepCount = ++lbuf.stepCount;
-
-            if (bufferIndex == shared->buffers.size() - 1) {
-              Profile p("python step_optimizer");
-              //log("Stepping optimizer\n");
-              for (auto& v : local) {
-                while (v.stepCount != stepCount);
-              }
-              {
-                py::gil_scoped_acquire gil;
-                //log("optimizer %d\n", bufferIndex);
-                learner_.attr("step_optimizer")();
-                //log("optimizer %d done \n", bufferIndex);
-              }
-            }
-
-            p.stop();
-
-//            float tt = mainTimer.elapsed();
-//            auto ts = [&](float v) {
-//              return fmt::sprintf("%g (%g%%)", v, v * 100 / tt);
-//            };
-//            std::string s;
-//            std::lock_guard l(profileMutex);
-//            for (auto& [key, value] : profileTimes) {
-//              if (!s.empty()) {
-//                s += " ";
-//              }
-//              s += key;
-//              s += ": ";
-//              s += ts(value);
-//            }
-//            log("total time: %g, %s\n", tt, s);
           } else {
-            ++lbuf.currentSequenceIndex;
+            if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
+              Profile p("step");
+              //std::lock_guard lm(modelMutex);
+              torch::GradMode::set_enabled(true);
+              //log("Stepping buffer %d\n", bufferIndex);
+              index = 0;
+              for (auto& [key, value] : input) {
+                //log("input [%s] = %s\n", key, sizesStr(value.sizes()));
+                value = lbuf.inputDeviceSeq.at(index);
+                ++index;
+              }
+              index = 0;
+              //log("lbuf.outputDeviceSeq.size() is %d\n", lbuf.outputDeviceSeq.size());
+              for (auto& [key, value] : outputMap) {
+                //log("output [%s] = %s\n", key, sizesStr(value.sizes()));
+                value = lbuf.outputDeviceSeq.at(index);
+                ++index;
+              }
+              //auto msStack = torch::stack(ms);
+              {
+  //              float sum = 0.0f;
+  //              for (auto& v : modelParameters) {
+  //                auto& grad = v.grad();
+  //                if (grad.defined()) {
+  //                  sum += grad.sum().item<float>();
+  //                }
+  //              }
+  //              log("pre step sum of grads: %g\n", sum);
+                Profile p("python step");
+                py::gil_scoped_acquire gil;
+                //log("step %d\n", bufferIndex);
+                learner_.attr("step")(input, outputMap);
+                //log("step %d done\n", bufferIndex);
+              }
+              lbuf.currentSequenceIndex = 0;
+
+              for (auto& v : ms) {
+                v.detach_();
+              }
+              for (auto& v : lbuf.inputDeviceSeq) {
+                v.detach_();
+              }
+              for (auto& v : lbuf.outputDeviceSeq) {
+                v.detach_();
+              }
+
+              torch::GradMode::set_enabled(false);
+
+              //log("Buffer %d stepped\n", bufferIndex);
+
+              int stepCount = ++lbuf.stepCount;
+
+              if (bufferIndex == shared->buffers.size() - 1) {
+                //log("Stepping optimizer\n");
+                Profile p("optimizer stuff");
+                for (auto& v : local) {
+                  while (v.stepCount != stepCount);
+                }
+
+                if (rpc) {
+                  if (hasPinged && !pingFuture) {
+                    log("Broker is lagging behind!");
+                  } else {
+                    hasPinged = true;
+                    pingFuture = call<void>("broker", "ping", groupName_, myName, numUpdates_);
+                  }
+  //                float sum = 0.0f;
+  //                for (auto& v : modelParameters) {
+  //                  auto& grad = v.grad();
+  //                  if (grad.defined()) {
+  //                    sum += grad.sum().item<float>();
+  //                  }
+  //                }
+  //                log("sum of grads: %g\n", sum);
+
+                  auto zeroGrad = [&]() {
+                    for (auto& v : modelParameters) {
+                      auto& grad = v.grad();
+                      if (grad.defined()) {
+                        grad.zero_();
+                      }
+                    }
+                  };
+
+                  std::unique_lock l(syncMutex);
+
+                  if (!members_.empty()) {
+                    std::string_view master = members_.front();
+                    if (syncMaster != master) {
+                      gradFuture.reset();
+                      if (syncMaster.empty()) {
+                        log("Master is %s\n", master);
+                      } else {
+                        log("Master changed from %s to %s\n", syncMaster, master);
+                      }
+                      if (master == myName) {
+                        log("I am now the master!\n");
+                      }
+                      syncMaster = master;
+                    }
+                    if (master == myName) {
+                      if (syncedGrads.empty()) {
+                        for (auto& v : modelParameters) {
+                          auto& grad = v.grad();
+                          if (grad.defined()) {
+                            syncedGrads.push_back(torch::zeros_like(grad, torch::TensorOptions(torch::kCPU).pinned_memory(true)));
+                          }
+                        }
+                      } else {
+                        log("Adding in %d gradients\n", numSyncedGradients);
+                        if (numSyncedGradients) {
+                          size_t i = 0;
+                          for (auto& v : modelParameters) {
+                            auto& grad = v.grad();
+                            if (grad.defined()) {
+                              if (i == syncedGrads.size()) {
+                                throw std::runtime_error("grads grew?");
+                              }
+                              grad.add_(syncedGrads[i].to(device, true));
+                              grad.mul_(1.0f / (1 + numSyncedGradients));
+                              syncedGrads[i].zero_();
+                              ++i;
+                            }
+                          }
+                          numSyncedGradients = 0;
+                        }
+                      }
+                      ++numUpdates_;
+                      log("numUpdates is now %d\n", numUpdates_);
+
+                      l.unlock();
+                      log("Stepping optimizer\n");
+                      Profile p("python step_optimizer");
+                      {
+                        py::gil_scoped_acquire gil;
+                        learner_.attr("step_optimizer")();
+                      }
+                      l.lock();
+
+                      std::vector<torch::Tensor> sendParameters;
+                      std::vector<torch::Tensor> sendBuffers;
+
+                      for (auto& v : modelParameters) {
+                        sendParameters.push_back(v.to(torch::kCPU, true, true));
+                      }
+                      for (auto& v : modelBuffers) {
+                        sendBuffers.push_back(v.to(torch::kCPU, true, true));
+                      }
+
+                      for (auto& n : members_) {
+                        if (n != myName) {
+                          call<bool>(n, "modelUpdate", groupName_, syncId_, numUpdates_, sendParameters, sendBuffers);
+                        }
+                      }
+
+                    } else {
+                      if (std::find(members_.begin(), members_.end(), myName) != members_.end()) {
+                        std::vector<torch::Tensor> grads;
+                        for (auto& v : modelParameters) {
+                          auto& grad = v.grad();
+                          if (grad.defined()) {
+                            grads.push_back(grad.to(torch::kCPU, false, true));
+                          }
+                        }
+                        log("Master %s, sync id {%#x, %#x}. Sending gradients\n", syncMaster, syncId_, numUpdates_);
+                        auto now = std::chrono::steady_clock::now();
+                        if (gradFuture && !*gradFuture && now - gradTimestamp < std::chrono::seconds(30)) {
+                          log("Warning: master is lagging behind for grad sync, skipping this one\n");
+                          ++masterLagCount;
+                          if (masterLagCount == 4) {
+                            log("Requesting resync\n");
+                            call<void>("broker", "resync", groupName_);
+                          }
+                        } else {
+                          //gradFuture = call<bool>(master, "grads", groupName_, syncId_, numUpdates_, grads);
+                          gradTimestamp = now;
+                          Future<bool> retval;
+                          rpc->asyncCallback<bool>(master, "grads", [retval](bool* value, rpc::Error* err) mutable {
+                            if (value) {
+                              log("grads returned %d!\n", *value);
+                              retval.set(*value);
+                            } else {
+                              log("RPC error: %s\n", err->what());
+                            }
+                          }, groupName_, syncId_, numUpdates_, grads);
+                          gradFuture = std::move(retval);
+                        }
+                      } else {
+                        log("I am not a member, not participating in sync!\n");
+                      }
+                    }
+                    zeroGrad();
+                  } else {
+                    log("No members, zeroing grad\n");
+                    zeroGrad();
+                  }
+
+                  if (haveNewParameters) {
+                    log("Got new parameters, numUpdates %d -> %d\n", numUpdates_, newNumUpdates);
+                    haveNewParameters = false;
+                    numUpdates_ = newNumUpdates;
+
+                    if (modelParameters.size() != newParameters.size()) {
+                      throw std::runtime_error("Model parameters size mismatch in update!");
+                    }
+                    if (modelBuffers.size() != newBuffers.size()) {
+                      throw std::runtime_error("Model parameters size mismatch in update!");
+                    }
+
+                    for (size_t i = 0; i != modelParameters.size(); ++i) {
+                      modelParameters[i].copy_(newParameters[i], true);
+                    }
+                    for (size_t i = 0; i != modelBuffers.size(); ++i) {
+                      modelBuffers[i].copy_(newBuffers[i], true);
+                    }
+                  }
+
+                  if (isCuda) {
+                    streamGuard->current_stream().synchronize();
+                  }
+
+                } else {
+                  Profile p("python step_optimizer");
+                  {
+                    py::gil_scoped_acquire gil;
+                    //log("optimizer %d\n", bufferIndex);
+                    learner_.attr("step_optimizer")();
+                    //log("optimizer %d done \n", bufferIndex);
+                  }
+                }
+              }
+
+              p.stop();
+
+  //            float tt = mainTimer.elapsed();
+  //            auto ts = [&](float v) {
+  //              return fmt::sprintf("%g (%g%%)", v, v * 100 / tt);
+  //            };
+  //            std::string s;
+  //            std::lock_guard l(profileMutex);
+  //            for (auto& [key, value] : profileTimes) {
+  //              if (!s.empty()) {
+  //                s += " ";
+  //              }
+  //              s += key;
+  //              s += ": ";
+  //              s += ts(value);
+  //            }
+  //            log("total time: %g, %s\n", tt, s);
+            } else {
+              ++lbuf.currentSequenceIndex;
+            }
           }
           lbuf.busy = false;
         });
@@ -1227,7 +1659,7 @@ struct TestJob {
         float tx = t.elapsedReset();
         int n = count;
         count = 0;
-        //log("rate %g/s\n", n / tx);
+        log("rate %g/s\n", n / tx);
       }
     }
 
@@ -1244,7 +1676,9 @@ struct TestJob {
 struct TestClient {
 
   std::atomic_bool terminate_ = false;
-  std::atomic_bool running_ = false;
+
+  std::string serverAddress_;
+  std::thread runThread;
 
   std::array<EnvBatch, 10> batch;
 
@@ -1255,110 +1689,318 @@ struct TestClient {
   }
 
   ~TestClient() {
+    py::gil_scoped_release gil;
     terminate_ = true;
-    while (running_);
+    runThread.join();
   }
 
-  void run(std::string serverAddress) {
-    py::gil_scoped_release gil;
-    running_ = true;
-    try {
+  void start(std::string serverAddress) {
+    serverAddress_ = serverAddress;
+    runThread = std::thread([this]() {
+      run();
+    });
+  }
 
-  //    rpc.define<void()>("quit", [this]() {
-  //      terminate_ = true;
-  //    });
+  void run() {
+    SharedMemory shm(serverAddress_);
+    Shared& shared = shm.as<Shared>();
 
-  //    rpc.define<bool(int)>("step", [this](int nParallel) {
-  //      //step(nParallel);
-  //      bool done;
-  //      float xx = 0.1;
-  //      for (int i = 0; i != 1000 * nParallel; ++i) {
-  //        xx = std::log(std::exp(xx));
-  //      }
-  //      done = xx < 0;
-  //      return !done;
-  //      //std::this_thread::sleep_for(std::chrono::milliseconds(nParallel));
-  //      return true;
-  //    });
+    int myIndex = shared.clients++;
 
-  //    rpc.connect("shm://" + serverAddress);
+    log("my index is %d\n", myIndex);
 
-  //    rpc.sync(serverAddress, "hello", rpc.getName());
+    if ((size_t)myIndex > maxClients) {
+      throw std::runtime_error("Client index is too high");
+    }
 
-      SharedMemory shm(serverAddress);
-      Shared& shared = shm.as<Shared>();
+    size_t bufferCounter = 0;
 
-      int myIndex = shared.clients++;
+    auto lastUpdate = std::chrono::steady_clock::now();
 
-      log("my index is %d\n", myIndex);
-
-      if ((size_t)myIndex > maxClients) {
-        throw std::runtime_error("Client index is too high");
-      }
-
-      size_t bufferCounter = 0;
-
-      auto lastUpdate = std::chrono::steady_clock::now();
-
-      while (true) {
-        size_t bufferIndex = bufferCounter % shared.buffers.size();
-        auto& buffer = shared.buffers[bufferIndex];
-        ++bufferCounter;
-        auto& input = buffer.clientInputs[myIndex];
-        auto& output = buffer.clientOutputs[myIndex];
-        size_t stepsDone = output.nStepsOut.load(std::memory_order_acquire);
-        size_t nSteps = input.nStepsIn.load(std::memory_order_acquire);
-        //log("client %d waiting for work\n", myIndex);
-        uint32_t timeCheckCounter = 0x10000;
-        while (nSteps == stepsDone) {
-          _mm_pause();
-          nSteps = input.nStepsIn.load(std::memory_order_acquire);
-          if (terminate_.load(std::memory_order_relaxed)) {
-            break;
-          }
-          if (--timeCheckCounter == 0) {
-            timeCheckCounter = 0x10000;
-            auto now = std::chrono::steady_clock::now();
-            if (now - lastUpdate >= std::chrono::seconds(600)) {
-              log("Client timed out\n");
-              terminate_ = true;
-              break;
-            }
-          }
-        }
+    while (true) {
+      size_t bufferIndex = bufferCounter % shared.buffers.size();
+      auto& buffer = shared.buffers[bufferIndex];
+      ++bufferCounter;
+      auto& input = buffer.clientInputs[myIndex];
+      auto& output = buffer.clientOutputs[myIndex];
+      size_t stepsDone = output.nStepsOut.load(std::memory_order_acquire);
+      size_t nSteps = input.nStepsIn.load(std::memory_order_acquire);
+      //log("client %d waiting for work\n", myIndex);
+      uint32_t timeCheckCounter = 0x10000;
+      while (nSteps == stepsDone) {
+        _mm_pause();
+        nSteps = input.nStepsIn.load(std::memory_order_acquire);
         if (terminate_.load(std::memory_order_relaxed)) {
           break;
         }
-        lastUpdate = std::chrono::steady_clock::now();
-        size_t offset = input.resultOffset;
-        //log("oh boy i got a task for %d steps\n", nSteps - stepsDone);
-        //log("client %d got work for buffer %d offset [%d, %d)\n", myIndex, bufferIndex, offset, offset + (nSteps - stepsDone));
-        batch.at(bufferIndex).step(nSteps - stepsDone, &shared, bufferIndex, offset);
-        output.nStepsOut.store(nSteps, std::memory_order_release);
+        if (--timeCheckCounter == 0) {
+          timeCheckCounter = 0x10000;
+          auto now = std::chrono::steady_clock::now();
+          if (now - lastUpdate >= std::chrono::seconds(600)) {
+            log("Client timed out\n");
+            terminate_ = true;
+            break;
+          }
+        }
+      }
+      if (terminate_.load(std::memory_order_relaxed)) {
+        break;
+      }
+      lastUpdate = std::chrono::steady_clock::now();
+      size_t offset = input.resultOffset;
+      //log("oh boy i got a task for %d steps\n", nSteps - stepsDone);
+      //log("client %d got work for buffer %d offset [%d, %d)\n", myIndex, bufferIndex, offset, offset + (nSteps - stepsDone));
+      batch.at(bufferIndex).step(nSteps - stepsDone, &shared, bufferIndex, offset);
+      output.nStepsOut.store(nSteps, std::memory_order_release);
 
 //        if (buffer.remaining.fetch_sub(1, std::memory_order_relaxed) == 1) {
 //          //shared->doneSem.post();
 //        }
-      }
-      running_ = false;
-    } catch (...) {
-      running_ = false;
-      throw;
     }
 
   }
 };
 
+struct Broker {
+
+  struct Peer {
+    std::string name;
+    std::chrono::steady_clock::time_point lastPing;
+    std::optional<Future<uint32_t>> syncFuture;
+    std::optional<Future<std::string>> updateFuture;
+    uint32_t numUpdates = 0;
+    bool active = false;
+    size_t order = 0;
+  };
+
+  struct Group {
+    std::mutex mutex;
+    std::string name;
+    std::unordered_map<std::string, Peer> peers;
+    bool needsUpdate = false;
+    std::chrono::steady_clock::time_point lastUpdate;
+    uint32_t syncId = 0x42;
+    size_t updateCount = 0;
+    size_t orderCounter = 0;
+
+    std::vector<std::string> active;
+
+    Peer& getPeer(std::string name) {
+      auto i = peers.try_emplace(name);
+      if (i.second) {
+        auto& p = i.first->second;
+        p.name = name;
+        p.order = orderCounter++;
+      }
+      return i.first->second;
+    }
+  };
+
+  std::mutex groupsMutex;
+  std::unordered_map<std::string, Group> groups;
+
+  Group& getGroup(const std::string& name) {
+    std::lock_guard l(groupsMutex);
+    auto i = groups.try_emplace(name);
+    if (i.second) {
+      auto& g = i.first->second;
+      g.name = name;
+    }
+    return i.first->second;
+  }
+
+  std::atomic_bool terminate_ = false;
+
+  std::string address;
+  rpc::Rpc server;
+  std::thread runThread;
+
+  Broker(std::string address) : address(address) {}
+  ~Broker() {
+    terminate_ = true;
+    //log("Note: Hackily quick-exiting\n");
+    std::quick_exit(1);
+    runThread.join();
+  }
+
+  template<typename T, typename... Args>
+  Future<T> call(std::string_view peerName, std::string_view funcName, Args&&... args) {
+    return callImpl<T>(server, peerName, funcName, std::forward<Args>(args)...);
+  }
+
+  void start() {
+    runThread = std::thread([this]() {
+      run();
+    });
+  }
+
+  void run() {
+
+    log("This is a broker process!\n");
+
+    server.setName("broker");
+
+    server.define<size_t(std::string)>("groupSize", [this](std::string group) {
+      log("groupSize called!\n");
+      auto& g = getGroup(group);
+      std::lock_guard l(g.mutex);
+      return g.peers.size();
+    });
+
+    server.define<void(std::string, std::string, uint32_t)>("ping", [this](std::string group, std::string name, uint32_t numUpdates) {
+      auto& g = getGroup(group);
+      std::lock_guard l(g.mutex);
+      auto& p = g.getPeer(name);
+      p.lastPing = std::chrono::steady_clock::now();
+      p.numUpdates = numUpdates;
+      if (!p.active) {
+        g.needsUpdate = true;
+      }
+      //log("got ping for %s::%s\n", group, name);
+    });
+
+    server.define<void(std::string)>("resync", [this](std::string group) {
+      auto& g = getGroup(group);
+      std::lock_guard l(g.mutex);
+      if (!g.needsUpdate) {
+        log("Got resync request for %s\n", group);
+        g.needsUpdate = true;
+      }
+    });
+
+    log("Broker listening on %s\n", address);
+    server.listen(address);
+
+    std::unordered_set<Group*> syncSet;
+    std::chrono::steady_clock::time_point lastCheckTimeouts;
+
+    std::vector<Group*> tmpGroups;
+    std::vector<Peer*> tmpPeers;
+
+    while (!terminate_) {
+      if (syncSet.empty()) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+      } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+        auto now = std::chrono::steady_clock::now();
+
+        for (auto i = syncSet.begin(); i != syncSet.end();) {
+          auto& g = **i;
+          std::lock_guard l(g.mutex);
+          size_t total = 0;
+          size_t ready = 0;
+          for ([[maybe_unused]] auto& [pname, p] : g.peers) {
+            if (p.syncFuture) {
+              ++total;
+              if (*p.syncFuture) {
+                if (**p.syncFuture == g.syncId) {
+                  ++ready;
+                } else {
+                  --total;
+                }
+              }
+            }
+          }
+          log("Sync midway %s %d/%d in %gs\n", g.name, ready, total, seconds(now - g.lastUpdate));
+          if (ready >= total || now - g.lastUpdate >= std::chrono::seconds(1)) {
+            log("Sync %s %d/%d in %gs\n", g.name, ready, total, seconds(now - g.lastUpdate));
+
+            tmpPeers.clear();
+            for ([[maybe_unused]] auto& [pname, p] : g.peers) {
+              if (p.syncFuture && *p.syncFuture && **p.syncFuture == g.syncId) {
+                tmpPeers.push_back(&p);
+                p.active = true;
+              } else {
+                p.active = false;
+              }
+            }
+            std::sort(tmpPeers.begin(), tmpPeers.end(), [](Peer* a, Peer* b) {
+              if (a->numUpdates == b->numUpdates) {
+                return a->order < b->order;
+              }
+              return a->numUpdates >= b->numUpdates;
+            });
+            g.active.clear();
+            for (auto* p : tmpPeers) {
+              log("%s has %d updates\n", p->name, p->numUpdates);
+              g.active.push_back(p->name);
+            }
+            if (!g.active.empty()) {
+              log("%s is the master\n", g.active.front());
+            }
+            for ([[maybe_unused]] auto& [pname, p] : g.peers) {
+              if (p.syncFuture && *p.syncFuture && **p.syncFuture == g.syncId) {
+                p.updateFuture = call<std::string>(pname, "update", g.name, g.active);
+              }
+            }
+
+            i = syncSet.erase(i);
+          } else {
+            ++i;
+          }
+        }
+
+        if (now - lastCheckTimeouts < std::chrono::milliseconds(500)) {
+          continue;
+        }
+      }
+      auto now = std::chrono::steady_clock::now();
+      lastCheckTimeouts = now;
+      tmpGroups.clear();
+      {
+        std::lock_guard l(groupsMutex);
+        for (auto& [gname, g] : groups) {
+          tmpGroups.push_back(&g);
+        }
+      }
+      for (auto* pg : tmpGroups) {
+        auto& g = *pg;
+        std::lock_guard l2(g.mutex);
+        for (auto i = g.peers.begin(); i != g.peers.end();) {
+          auto& p = i->second;
+          if (now - p.lastPing >= std::chrono::seconds(60)) {
+            log("Peer %s::%s timed out\n", g.name, p.name);
+            if (p.active) {
+              g.needsUpdate = true;
+            }
+            i = g.peers.erase(i);
+          } else {
+            ++i;
+          }
+        }
+        auto mintime = std::chrono::seconds(30);
+        if (g.updateCount < 10) {
+          mintime = std::chrono::seconds(2);
+        }
+        if (g.needsUpdate && (now - g.lastUpdate >= mintime)) {
+          log("Initiating update of group %s\n", g.name);
+          ++g.updateCount;
+          g.lastUpdate = now;
+          g.needsUpdate = false;
+          uint32_t syncId = ++g.syncId;
+          for ([[maybe_unused]] auto& [pname, p] : g.peers) {
+            p.syncFuture = call<uint32_t>(pname, "sync", g.name, syncId);
+          }
+          syncSet.insert(&g);
+        }
+      }
+    }
+  }
+};
 
 PYBIND11_MODULE(pyjob, m) {
   m.def("set_logging", [](py::object logging) {
     pyLogging = logging;
   });
+  py::class_<Broker>(m, "Broker")
+      .def(py::init<std::string>())
+      .def("start", &Broker::start);
   py::class_<TestJob>(m, "TestJob")
-      .def(py::init<>())
+      .def(py::init<std::string, std::string>())
       .def("start", &TestJob::start)
       .def("get_name", &TestJob::getName);
   py::class_<TestClient>(m, "TestClient")
       .def(py::init<py::object>())
-      .def("run", &TestClient::run);
+      .def("start", &TestClient::start);
 }

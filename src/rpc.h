@@ -128,13 +128,16 @@ struct Rpc {
           in();
           out();
         } else if (exceptionMode == ExceptionMode::DeserializationOnly) {
+          bool success = false;
           try {
             in();
+            success = true;
           } catch (const std::exception& e) {
             serializeToBuffer(outbuffer, (uint32_t)0, (uint32_t)reqError, (uint32_t)0, std::string_view(e.what()));
-            return;
           }
-          out();
+          if (success) {
+            out();
+          }
         } else {
           try {
             in();

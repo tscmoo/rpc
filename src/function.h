@@ -5,7 +5,7 @@
 namespace rpc {
 
 template<typename T>
-using Function = tensorpipe::Function<T>;
-using FunctionPointer = tensorpipe::FunctionPointer;
+using Function = rpc_tensorpipe::Function<T>;
+using FunctionPointer = rpc_tensorpipe::FunctionPointer;
 
 }
