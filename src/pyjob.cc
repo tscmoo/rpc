@@ -39,8 +39,8 @@ std::mutex logMutex;
 
 template<typename... Args>
 void log(const char* fmt, Args&&... args) {
-  std::lock_guard l(logMutex);
   if (pyLogging.is_none()) {
+    std::lock_guard l(logMutex);
     time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     auto* tm = std::localtime(&now);
     char buf[0x40];
@@ -51,6 +51,7 @@ void log(const char* fmt, Args&&... args) {
     } else {
       fmt::printf("%s: %s\n", buf, s);
     }
+    fflush(stdout);
   } else {
     auto s = fmt::sprintf(fmt, std::forward<Args>(args)...);
     if (s.size() && s.back() == '\n') {
@@ -538,6 +539,7 @@ struct Env {
 
   uint32_t episodeStep = 0;
   float episodeReturn = 0;
+  std::atomic<bool> terminate_ = false;
 
   Env(py::object env) {
     py::gil_scoped_acquire gil;
@@ -616,6 +618,9 @@ struct Env {
       auto& sa = shared->buffers[bufferIndex].envInputs[batchIndex].action;
       do {
         action = sa.load(std::memory_order_acquire);
+        if (terminate_) {
+          return;
+        }
       } while (action == kInvalidAction);
       sa.store(kInvalidAction, std::memory_order_release);
       //log("buffer %d index %d got action %d\n", bufferIndex, batchIndex, action);
@@ -711,7 +716,7 @@ struct Env {
 
 struct EnvBatch {
   py::object envInit_;
-  std::vector<Env> envs;
+  std::list<Env> envs;
   EnvBatch() = default;
   EnvBatch(py::object envInit) : envInit_(std::move(envInit)) {}
   ~EnvBatch() {
@@ -730,6 +735,12 @@ struct EnvBatch {
   }
 };
 
+struct QueuedData {
+  std::vector<torch::Tensor> inputDeviceSeq;
+  std::vector<torch::Tensor> outputDeviceSeq;
+  std::vector<torch::Tensor> initialModelState;
+};
+
 struct LocalBuffer {
   std::vector<torch::Tensor> inputShared;
   std::vector<torch::Tensor> inputPinned;
@@ -742,6 +753,7 @@ struct LocalBuffer {
 
   std::vector<torch::Tensor> inputDeviceSeq;
   std::vector<torch::Tensor> outputDeviceSeq;
+  std::vector<torch::Tensor> initialModelState;
 
   size_t currentSequenceIndex = 0;
 
@@ -838,6 +850,7 @@ struct TestJob {
 
   Future<void> pingFuture;
   bool hasPinged = false;
+  std::chrono::steady_clock::time_point lastPing;
   std::string groupName_;
 
   uint32_t numUpdates_ = 0;
@@ -859,7 +872,23 @@ struct TestJob {
   std::vector<torch::Tensor> modelParameters;
   std::vector<torch::Tensor> modelBuffers;
 
+  std::vector<QueuedData> trainQueue;
+
   bool gradMode = false;
+
+  std::optional<Future<bool>> gradFuture;
+  std::chrono::steady_clock::time_point gradTimestamp;
+  int masterLagCount = 0;
+
+  torch::Device device = torch::kCPU;
+  bool isCuda = false;
+  std::optional<c10::cuda::CUDAStream> trainCudaStream;
+  std::mutex modelMutex;
+
+  std::deque<LocalBuffer> local;
+
+  size_t trainBatchSize = 256;
+  size_t actorBatchSize = 1024;
 
   template<typename T, typename... Args>
   Future<T> call(std::string_view peerName, std::string_view funcName, Args&&... args) {
@@ -920,21 +949,22 @@ struct TestJob {
           log("Got grads for wrong number of grads (%d, should be %d)\n", grads.size(), syncedGrads.size());
           return false;
         }
-        log("Recv grads %#x %#x\n", syncId, numUpdates);
-        if (numUpdates_ - numUpdates <= 1) {
+        uint32_t age = numUpdates_ - numUpdates;
+        log("Recv grads %#x %#x (age %d)\n", syncId, numUpdates, age);
+        if (age <= 2) {
           ++numSyncedGradients;
           for (size_t i = 0; i != grads.size(); ++i) {
             syncedGrads[i].add_(grads[i]);
           }
           return true;
         } else {
-          log("Ignoring grads as they are too old (age %d)\n", numUpdates_ - numUpdates);
+          log("Ignoring grads as they are too old (age %d)\n", age);
           return false;
         }
       });
 
       rpc->define<bool(std::string_view, uint32_t, uint32_t, std::vector<torch::Tensor>, std::vector<torch::Tensor>)>("modelUpdate", [this](std::string_view group, uint32_t syncId, uint32_t numUpdates, std::vector<torch::Tensor> parameters, std::vector<torch::Tensor> buffers) {
-        std::lock_guard l(syncMutex);
+        std::unique_lock l(syncMutex);
         if (group != groupName_) {
           log("Got model update for wrong group %s\n", group);
           return false;
@@ -962,8 +992,16 @@ struct TestJob {
       log("My name is %s, connecting to broker at %s\n", myName, brokerAddress);
       rpc->connect(brokerAddress);
       auto fut = rpc->async<size_t>("broker", "groupSize", groupName);
-      if (fut.wait_for(std::chrono::seconds(60)) != std::future_status::ready) {
-        throw std::runtime_error("Timed out connecting to broker at " + brokerAddress);
+      for (int i = 0;; ++i) {
+        if (fut.wait_for(std::chrono::seconds(1)) == std::future_status::ready) {
+          break;
+        }
+        if (terminate_) {
+          return;
+        }
+        if (i == 64) {
+          throw std::runtime_error("Timed out connecting to broker at " + brokerAddress);
+        }
       }
       size_t n = fut.get();
       log("Group %s has %d existing members\n", groupName, n);
@@ -988,6 +1026,26 @@ struct TestJob {
     });
   }
 
+  void commitModelUpdate() {
+    log("Got new parameters, numUpdates %d -> %d\n", numUpdates_, newNumUpdates);
+    haveNewParameters = false;
+    numUpdates_ = newNumUpdates;
+
+    if (modelParameters.size() != newParameters.size()) {
+      throw std::runtime_error("Model parameters size mismatch in update!");
+    }
+    if (modelBuffers.size() != newBuffers.size()) {
+      throw std::runtime_error("Model parameters size mismatch in update!");
+    }
+
+    for (size_t i = 0; i != modelParameters.size(); ++i) {
+      modelParameters[i].copy_(newParameters[i], true);
+    }
+    for (size_t i = 0; i != modelBuffers.size(); ++i) {
+      modelBuffers[i].copy_(newBuffers[i], true);
+    }
+  }
+
   struct EnvState {
     std::vector<torch::Tensor> modelState;
   };
@@ -1009,17 +1067,238 @@ struct TestJob {
     return s;
   }
 
-  struct ModelUpdateTracker {
-    std::optional<Future<bool>> future;
-    std::chrono::steady_clock::time_point timestamp;
-  };
+  void trainStep(
+        const std::map<std::string, torch::Tensor>& inputMap,
+        const std::map<std::string, torch::Tensor>& outputMap,
+        const std::vector<torch::Tensor>& initialState,
+        bool runOptimizer) {
 
-  std::unordered_map<std::string, ModelUpdateTracker> modelUpdateTracker;
+    if (isCuda) {
+      if (!trainCudaStream) {
+        trainCudaStream = c10::cuda::getStreamFromPool(false, device.index());
+      }
+      c10::cuda::set_device(device.index());
+      c10::cuda::setCurrentCUDAStream(*trainCudaStream);
+    }
+
+    for (auto& l : local) {
+      if (l.cudaStream) {
+        l.cudaStream->synchronize();
+      }
+    }
+
+    {
+      std::lock_guard l(syncMutex);
+      if (haveNewParameters) {
+        commitModelUpdate();
+      }
+    }
+
+    //auto msStack = torch::stack(ms);
+    if (false) {
+      log("step wee\n");
+    } else {
+      torch::GradMode::set_enabled(true);
+//              float sum = 0.0f;
+//              for (auto& v : modelParameters) {
+//                auto& grad = v.grad();
+//                if (grad.defined()) {
+//                  sum += grad.sum().item<float>();
+//                }
+//              }
+//              log("pre step sum of grads: %g\n", sum);
+      Profile p("python step");
+      py::gil_scoped_acquire gil;
+      if (initialState.empty()) {
+        learner_.attr("step")(inputMap, outputMap);
+      } else {
+        learner_.attr("step")(inputMap, outputMap, initialState);
+      }
+      //log("step %d done\n", bufferIndex);
+    }
+
+    torch::GradMode::set_enabled(false);
+
+    //log("Buffer %d stepped\n", bufferIndex);
+
+    auto zeroGrad = [&]() {
+      for (auto& v : modelParameters) {
+        auto& grad = v.grad();
+        if (grad.defined()) {
+          grad.detach_();
+          grad.zero_();
+        }
+      }
+    };
+
+    if (rpc) {
+      auto now = std::chrono::steady_clock::now();
+      if (hasPinged && !pingFuture && now - lastPing < std::chrono::seconds(10)) {
+        log("Broker is lagging behind!");
+      } else if (now - lastPing >= std::chrono::seconds(4)) {
+        lastPing = now;
+        hasPinged = true;
+        pingFuture = call<void>("broker", "ping", groupName_, myName, numUpdates_);
+      }
+//                float sum = 0.0f;
+//                for (auto& v : modelParameters) {
+//                  auto& grad = v.grad();
+//                  if (grad.defined()) {
+//                    sum += grad.sum().item<float>();
+//                  }
+//                }
+//                log("sum of grads: %g\n", sum);
+
+      std::unique_lock l(syncMutex);
+
+      if (!members_.empty()) {
+        std::string_view master = members_.front();
+        if (syncMaster != master) {
+          gradFuture.reset();
+          if (syncMaster.empty()) {
+            log("Master is %s\n", master);
+          } else {
+            log("Master changed from %s to %s\n", syncMaster, master);
+          }
+          if (master == myName) {
+            log("I am now the master!\n");
+          }
+          syncMaster = master;
+        }
+
+        if (master != myName) {
+          if (std::find(members_.begin(), members_.end(), myName) != members_.end()) {
+            std::vector<torch::Tensor> grads;
+            for (auto& v : modelParameters) {
+              auto& grad = v.grad();
+              if (grad.defined()) {
+                grads.push_back(grad.to(torch::kCPU, false, true));
+              }
+            }
+            log("Master %s, sync id {%#x, %#x}. Sending gradients\n", syncMaster, syncId_, numUpdates_);
+            auto now = std::chrono::steady_clock::now();
+            if (gradFuture && !*gradFuture && now - gradTimestamp < std::chrono::seconds(30)) {
+              log("Warning: master is lagging behind for grad sync, skipping this one\n");
+              ++masterLagCount;
+              if (masterLagCount == 4) {
+                log("Requesting resync\n");
+                call<void>("broker", "resync", groupName_);
+              }
+            } else {
+              //gradFuture = call<bool>(master, "grads", groupName_, syncId_, numUpdates_, grads);
+              gradTimestamp = now;
+              Future<bool> retval;
+              rpc->asyncCallback<bool>(master, "grads", [retval](bool* value, rpc::Error* err) mutable {
+                if (value) {
+                  log("grads returned %d!\n", *value);
+                  retval.set(*value);
+                } else {
+                  log("RPC error: %s\n", err->what());
+                }
+              }, groupName_, syncId_, numUpdates_, grads);
+              gradFuture = std::move(retval);
+            }
+          } else {
+            log("I am not a member, not participating in sync!\n");
+          }
+          zeroGrad();
+        }
+      }
+
+      Profile p("optimizer stuff");
+
+      if (runOptimizer) {
+
+        if (!members_.empty()) {
+          std::string_view master = members_.front();
+          if (master == myName) {
+            if (syncedGrads.empty()) {
+              for (auto& v : modelParameters) {
+                auto& grad = v.grad();
+                if (grad.defined()) {
+                  syncedGrads.push_back(torch::zeros_like(grad, torch::TensorOptions(torch::kCPU).pinned_memory(true)));
+                }
+              }
+            } else {
+              log("Adding in %d gradients\n", numSyncedGradients);
+              if (numSyncedGradients) {
+                size_t i = 0;
+                for (auto& v : modelParameters) {
+                  auto& grad = v.grad();
+                  if (grad.defined()) {
+                    if (i == syncedGrads.size()) {
+                      throw std::runtime_error("grads grew?");
+                    }
+                    grad.add_(syncedGrads[i].to(device, true));
+                    grad.mul_(1.0f / (1 + numSyncedGradients));
+                    syncedGrads[i].zero_();
+                    ++i;
+                  }
+                }
+                numSyncedGradients = 0;
+              }
+            }
+            ++numUpdates_;
+            log("numUpdates is now %d\n", numUpdates_);
+
+            l.unlock();
+            log("Stepping optimizer\n");
+            Profile p("python step_optimizer");
+            {
+              py::gil_scoped_acquire gil;
+              learner_.attr("step_optimizer")();
+            }
+            l.lock();
+
+            std::vector<torch::Tensor> sendParameters;
+            std::vector<torch::Tensor> sendBuffers;
+
+            for (auto& v : modelParameters) {
+              sendParameters.push_back(v.to(torch::kCPU, true, true));
+            }
+            for (auto& v : modelBuffers) {
+              sendBuffers.push_back(v.to(torch::kCPU, true, true));
+            }
+
+            for (auto& n : members_) {
+              if (n != myName) {
+                call<bool>(n, "modelUpdate", groupName_, syncId_, numUpdates_, sendParameters, sendBuffers);
+              }
+            }
+
+            zeroGrad();
+          }
+        } else {
+          log("No members, zeroing grad\n");
+          zeroGrad();
+        }
+
+        if (haveNewParameters) {
+          commitModelUpdate();
+        }
+
+        if (isCuda) {
+          trainCudaStream->synchronize();
+        }
+
+      } else {
+        Profile p("python step_optimizer");
+        {
+          py::gil_scoped_acquire gil;
+          //log("optimizer %d\n", bufferIndex);
+          learner_.attr("step_optimizer")();
+          //log("optimizer %d done \n", bufferIndex);
+        }
+      }
+    }
+
+    //p.stop();
+  }
 
   void run() {
 
-    torch::Device device(deviceStr_);
-    bool isCuda = device.is_cuda();
+    device = torch::Device(deviceStr_);
+    isCuda = device.is_cuda();
     torch::NoGradGuard ng;
 
     log("isCuda: %d\n", isCuda);
@@ -1028,8 +1307,7 @@ struct TestJob {
     int count = 0;
 
     size_t bufferCounter = 0;
-
-    std::deque<LocalBuffer> local;
+    size_t optimizeCounter = 0;
 
     local.resize(shared->buffers.size());
 
@@ -1041,13 +1319,7 @@ struct TestJob {
 
     async::SchedulerFifo asyncSync;
 
-    std::mutex modelMutex;
-
     size_t nClients = 0;
-
-    std::optional<Future<bool>> gradFuture;
-    std::chrono::steady_clock::time_point gradTimestamp;
-    int masterLagCount = 0;
 
     while (shared->clients != numClients_) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -1067,6 +1339,8 @@ struct TestJob {
       batchSize = learner_.attr("batch_size").cast<int>();
       unrollLength = learner_.attr("unroll_length").cast<int>();
     }
+
+    trainBatchSize = batchSize;
 
     log("Using an unroll length of %d and a batch size of %d\n", unrollLength, batchSize);
 
@@ -1104,7 +1378,9 @@ struct TestJob {
 
         std::optional<c10::cuda::CUDAStreamGuard> streamGuard;
         if (isCuda) {
-          lbuf.cudaStream = c10::cuda::getStreamFromPool(false, device.index());
+          if (!lbuf.cudaStream) {
+            lbuf.cudaStream = c10::cuda::getStreamFromPool(false, device.index());
+          }
           streamGuard.emplace(*lbuf.cudaStream);
         }
 
@@ -1113,7 +1389,7 @@ struct TestJob {
         size_t clientIndex = 0;
         if (size == 0) {
 
-          size_t size = batchSize;
+          size_t size = actorBatchSize;
 
           size_t strideDivisor = nClients;
           size_t stride = (size + strideDivisor - 1) / strideDivisor;
@@ -1204,7 +1480,7 @@ struct TestJob {
 
             auto opts = torch::TensorOptions(value.dtype()).device(device);
             std::vector<int64_t> sizes = value.sizes().vec();
-            sizes.at(0) = batchSize;
+            sizes.at(0) = actorBatchSize;
             sizes.insert(sizes.begin(), (int64_t)unrollLength);
             lbuf.inputDeviceSeq.push_back(torch::empty(sizes,  opts));
           }
@@ -1221,14 +1497,15 @@ struct TestJob {
 //          for (auto& [key, value] : input) {
 //            log("input [%s] sizes = %s\n", key, sizesStr(value.sizes()));
 //          }
-        asyncforward.run([&, size, stride, bufferIndex]() {
+        //asyncforward.run([&, size, stride, bufferIndex]() {
+        {
           Profile p("aforward");
           std::optional<c10::cuda::CUDAStreamGuard> streamGuard;
           if (isCuda) {
             streamGuard.emplace(*lbuf.cudaStream);
           }
 
-          std::lock_guard lm(modelMutex);
+          //std::lock_guard lm(modelMutex);
 
           torch::AutoGradMode ng(false);
 
@@ -1275,9 +1552,17 @@ struct TestJob {
 //            log("sum %g\n", value.sum().item<float>());
 //          }
 
+          if (gradMode == false && lbuf.currentSequenceIndex == 0) {
+            lbuf.initialModelState = ms;
+          }
+
           pprepare.stop();
 
-          //std::lock_guard lm(modelMutex);
+          std::lock_guard lm(modelMutex);
+
+          if (trainCudaStream) {
+            trainCudaStream->synchronize();
+          }
 
           torch::Tensor action;
           std::map<std::string, torch::Tensor> outputMap;
@@ -1286,28 +1571,18 @@ struct TestJob {
             Profile p("python model forward");
             py::gil_scoped_acquire gil;
             //log("model forward %d\n", bufferIndex);
-            py::tuple tup = model_(input, ms, true);
-//            while (true) {
-//              tup = model_(input, ms, true);
-
-//              count += batchSize;
-
-//              if (t.elapsed() >= 1.0f) {
-//                float tx = t.elapsedReset();
-//                int n = count;
-//                count = 0;
-//                log("rate %g/s\n", n / tx);
-//              }
-//            }
+            py::tuple tup = model_(input, ms, !gradMode);
             py::dict output = tup[0];
             py::tuple outstate = tup[1];
             for (size_t i = 0; i != ms.size(); ++i) {
               ms[i] = outstate[i].cast<torch::Tensor>();
             }
             outputMap = output.cast<std::map<std::string, torch::Tensor>>();
-
-            //log("model forward %d done\n", bufferIndex);
           }
+//          for (size_t i = 0; i != size; ++i) {
+//            buffer.envInputs[i].action.store(10, std::memory_order_relaxed);
+//            //buffer.envInputs[i].action.store(10, std::memory_order_relaxed);
+//          }
           Profile paction("action");
           action = outputMap["action"];
           if (action.dim() != 2 || action.size(0) != 1 || (size_t)action.size(1) != size) {
@@ -1336,7 +1611,7 @@ struct TestJob {
                 throw std::runtime_error("Model output has not enough dimensions");
               }
               sizes.at(0) = unrollLength;
-              sizes.at(1) = batchSize;
+              sizes.at(1) = actorBatchSize;
               auto opts = torch::TensorOptions(value.dtype()).device(device);
               lbuf.outputDeviceSeq.push_back(torch::empty(sizes, opts));
 
@@ -1358,10 +1633,10 @@ struct TestJob {
           }
           poutput.stop();
           torch::GradMode::set_enabled(false);
-          asyncAction.run([this, &buffer, &lbuf, size, isCuda, stream = isCuda ? std::make_optional<c10::cuda::CUDAStream>(streamGuard->current_stream()) : std::optional<c10::cuda::CUDAStream>{}]() {
+          asyncAction.run([this, &buffer, &lbuf, size]() {
             if (isCuda) {
               Profile p("synchronize");
-              stream->synchronize();
+              lbuf.cudaStream->synchronize();
             }
             auto& action = lbuf.actionPinned;
             if (action.scalar_type() != torch::kLong) {
@@ -1378,7 +1653,7 @@ struct TestJob {
               //buffer.envInputs[i].action.store(10, std::memory_order_relaxed);
             }
           });
-          if (gradMode == false) {
+          if (false) {
             if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
               lbuf.currentSequenceIndex = 0;
             } else {
@@ -1386,262 +1661,186 @@ struct TestJob {
             }
           } else {
             if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
-              Profile p("step");
-              //std::lock_guard lm(modelMutex);
-              torch::GradMode::set_enabled(true);
-              //log("Stepping buffer %d\n", bufferIndex);
-              index = 0;
-              for (auto& [key, value] : input) {
-                //log("input [%s] = %s\n", key, sizesStr(value.sizes()));
-                value = lbuf.inputDeviceSeq.at(index);
-                ++index;
-              }
-              index = 0;
-              //log("lbuf.outputDeviceSeq.size() is %d\n", lbuf.outputDeviceSeq.size());
-              for (auto& [key, value] : outputMap) {
-                //log("output [%s] = %s\n", key, sizesStr(value.sizes()));
-                value = lbuf.outputDeviceSeq.at(index);
-                ++index;
-              }
-              //auto msStack = torch::stack(ms);
-              {
-  //              float sum = 0.0f;
-  //              for (auto& v : modelParameters) {
-  //                auto& grad = v.grad();
-  //                if (grad.defined()) {
-  //                  sum += grad.sum().item<float>();
-  //                }
-  //              }
-  //              log("pre step sum of grads: %g\n", sum);
-                Profile p("python step");
-                py::gil_scoped_acquire gil;
-                //log("step %d\n", bufferIndex);
-                learner_.attr("step")(input, outputMap);
-                //log("step %d done\n", bufferIndex);
-              }
               lbuf.currentSequenceIndex = 0;
 
-              for (auto& v : ms) {
-                v.detach_();
-              }
-              for (auto& v : lbuf.inputDeviceSeq) {
-                v.detach_();
-              }
-              for (auto& v : lbuf.outputDeviceSeq) {
-                v.detach_();
-              }
+              if (gradMode == false) {
 
-              torch::GradMode::set_enabled(false);
+                QueuedData qd;
+                qd.inputDeviceSeq = std::move(lbuf.inputDeviceSeq);
+                qd.outputDeviceSeq = std::move(lbuf.outputDeviceSeq);
+                qd.initialModelState = std::move(lbuf.initialModelState);
 
-              //log("Buffer %d stepped\n", bufferIndex);
-
-              int stepCount = ++lbuf.stepCount;
-
-              if (bufferIndex == shared->buffers.size() - 1) {
-                //log("Stepping optimizer\n");
-                Profile p("optimizer stuff");
-                for (auto& v : local) {
-                  while (v.stepCount != stepCount);
+                lbuf.inputDeviceSeq.resize(qd.inputDeviceSeq.size());
+                lbuf.outputDeviceSeq.resize(qd.outputDeviceSeq.size());
+                for (size_t i = 0; i != qd.inputDeviceSeq.size(); ++i) {
+                  lbuf.inputDeviceSeq[i] = torch::empty_like(qd.inputDeviceSeq[i]);
+                }
+                for (size_t i = 0; i != qd.outputDeviceSeq.size(); ++i) {
+                  lbuf.outputDeviceSeq[i] = torch::empty_like(qd.outputDeviceSeq[i]);
                 }
 
-                if (rpc) {
-                  if (hasPinged && !pingFuture) {
-                    log("Broker is lagging behind!");
-                  } else {
-                    hasPinged = true;
-                    pingFuture = call<void>("broker", "ping", groupName_, myName, numUpdates_);
+                trainQueue.push_back(std::move(qd));
+
+                log("trainQueue size grew to %d\n", trainQueue.size());
+
+                while (!trainQueue.empty()) {
+
+                  size_t n = 0;
+                  size_t inputSize = 0;
+                  size_t outputSize = 0;
+                  size_t stateSize = 0;
+                  for (auto& v : trainQueue) {
+                    n += v.inputDeviceSeq.front().size(1);
+                    if (n >= trainBatchSize) {
+                      inputSize = v.inputDeviceSeq.size();
+                      outputSize = v.outputDeviceSeq.size();
+                      stateSize = v.initialModelState.size();
+                      break;
+                    }
                   }
-  //                float sum = 0.0f;
-  //                for (auto& v : modelParameters) {
-  //                  auto& grad = v.grad();
-  //                  if (grad.defined()) {
-  //                    sum += grad.sum().item<float>();
-  //                  }
-  //                }
-  //                log("sum of grads: %g\n", sum);
+                  if (n < trainBatchSize) {
+                    break;
+                  }
 
-                  auto zeroGrad = [&]() {
-                    for (auto& v : modelParameters) {
-                      auto& grad = v.grad();
-                      if (grad.defined()) {
-                        grad.zero_();
-                      }
+                  std::vector<std::vector<torch::Tensor>> inputStack(inputSize);
+                  std::vector<std::vector<torch::Tensor>> outputStack(outputSize);
+                  std::vector<std::vector<torch::Tensor>> initialStateStack(stateSize);
+                  n = 0;
+                  for (auto it = trainQueue.begin(); it != trainQueue.end();) {
+                    auto& v = *it;
+                    if (v.inputDeviceSeq.size() != inputSize) {
+                      throw std::runtime_error("trainQueue input size mismatch");
                     }
-                  };
-
-                  std::unique_lock l(syncMutex);
-
-                  if (!members_.empty()) {
-                    std::string_view master = members_.front();
-                    if (syncMaster != master) {
-                      gradFuture.reset();
-                      if (syncMaster.empty()) {
-                        log("Master is %s\n", master);
-                      } else {
-                        log("Master changed from %s to %s\n", syncMaster, master);
-                      }
-                      if (master == myName) {
-                        log("I am now the master!\n");
-                      }
-                      syncMaster = master;
+                    if (v.outputDeviceSeq.size() != outputSize) {
+                      throw std::runtime_error("trainQueue output size mismatch");
                     }
-                    if (master == myName) {
-                      if (syncedGrads.empty()) {
-                        for (auto& v : modelParameters) {
-                          auto& grad = v.grad();
-                          if (grad.defined()) {
-                            syncedGrads.push_back(torch::zeros_like(grad, torch::TensorOptions(torch::kCPU).pinned_memory(true)));
-                          }
-                        }
-                      } else {
-                        log("Adding in %d gradients\n", numSyncedGradients);
-                        if (numSyncedGradients) {
-                          size_t i = 0;
-                          for (auto& v : modelParameters) {
-                            auto& grad = v.grad();
-                            if (grad.defined()) {
-                              if (i == syncedGrads.size()) {
-                                throw std::runtime_error("grads grew?");
-                              }
-                              grad.add_(syncedGrads[i].to(device, true));
-                              grad.mul_(1.0f / (1 + numSyncedGradients));
-                              syncedGrads[i].zero_();
-                              ++i;
-                            }
-                          }
-                          numSyncedGradients = 0;
-                        }
+                    if (v.initialModelState.size() != stateSize) {
+                      throw std::runtime_error("trainQueue state size mismatch");
+                    }
+                    size_t remaining = trainBatchSize - n;
+                    size_t s = v.inputDeviceSeq.front().size(1);
+                    if (remaining >= s) {
+                      for (size_t i = 0; i != v.inputDeviceSeq.size(); ++i) {
+                        inputStack[i].push_back(v.inputDeviceSeq[i]);
                       }
-                      ++numUpdates_;
-                      log("numUpdates is now %d\n", numUpdates_);
-
-                      l.unlock();
-                      log("Stepping optimizer\n");
-                      Profile p("python step_optimizer");
-                      {
-                        py::gil_scoped_acquire gil;
-                        learner_.attr("step_optimizer")();
+                      for (size_t i = 0; i != v.outputDeviceSeq.size(); ++i) {
+                        outputStack[i].push_back(v.outputDeviceSeq[i]);
                       }
-                      l.lock();
-
-                      std::vector<torch::Tensor> sendParameters;
-                      std::vector<torch::Tensor> sendBuffers;
-
-                      for (auto& v : modelParameters) {
-                        sendParameters.push_back(v.to(torch::kCPU, true, true));
+                      for (size_t i = 0; i != v.initialModelState.size(); ++i) {
+                        initialStateStack[i].push_back(v.initialModelState[i]);
                       }
-                      for (auto& v : modelBuffers) {
-                        sendBuffers.push_back(v.to(torch::kCPU, true, true));
-                      }
-
-                      for (auto& n : members_) {
-                        if (n != myName) {
-                          call<bool>(n, "modelUpdate", groupName_, syncId_, numUpdates_, sendParameters, sendBuffers);
-                        }
-                      }
-
+                      it = trainQueue.erase(it);
                     } else {
-                      if (std::find(members_.begin(), members_.end(), myName) != members_.end()) {
-                        std::vector<torch::Tensor> grads;
-                        for (auto& v : modelParameters) {
-                          auto& grad = v.grad();
-                          if (grad.defined()) {
-                            grads.push_back(grad.to(torch::kCPU, false, true));
-                          }
-                        }
-                        log("Master %s, sync id {%#x, %#x}. Sending gradients\n", syncMaster, syncId_, numUpdates_);
-                        auto now = std::chrono::steady_clock::now();
-                        if (gradFuture && !*gradFuture && now - gradTimestamp < std::chrono::seconds(30)) {
-                          log("Warning: master is lagging behind for grad sync, skipping this one\n");
-                          ++masterLagCount;
-                          if (masterLagCount == 4) {
-                            log("Requesting resync\n");
-                            call<void>("broker", "resync", groupName_);
-                          }
-                        } else {
-                          //gradFuture = call<bool>(master, "grads", groupName_, syncId_, numUpdates_, grads);
-                          gradTimestamp = now;
-                          Future<bool> retval;
-                          rpc->asyncCallback<bool>(master, "grads", [retval](bool* value, rpc::Error* err) mutable {
-                            if (value) {
-                              log("grads returned %d!\n", *value);
-                              retval.set(*value);
-                            } else {
-                              log("RPC error: %s\n", err->what());
-                            }
-                          }, groupName_, syncId_, numUpdates_, grads);
-                          gradFuture = std::move(retval);
-                        }
-                      } else {
-                        log("I am not a member, not participating in sync!\n");
+                      size_t remove = remaining;
+                      //log("remove is %d\n", remove);
+                      for (size_t i = 0; i != v.inputDeviceSeq.size(); ++i) {
+                        //log("v.inputDeviceSeq[i] shape is %s\n", sizesStr(v.inputDeviceSeq[i].sizes()));
+                        inputStack[i].push_back(v.inputDeviceSeq[i].narrow(1, 0, remove));
+                        v.inputDeviceSeq[i] = v.inputDeviceSeq[i].narrow(1, remove, s - remove);
+                      }
+                      for (size_t i = 0; i != v.outputDeviceSeq.size(); ++i) {
+                        //log("v.outputDeviceSeq[i] shape is %s\n", sizesStr(v.outputDeviceSeq[i].sizes()));
+                        outputStack[i].push_back(v.outputDeviceSeq[i].narrow(1, 0, remove));
+                        v.outputDeviceSeq[i] = v.outputDeviceSeq[i].narrow(1, remove, s - remove);
+                      }
+                      for (size_t i = 0; i != v.initialModelState.size(); ++i) {
+                        //log("v.initialModelState[i] shape is %s\n", sizesStr(v.initialModelState[i].sizes()));
+                        initialStateStack[i].push_back(v.initialModelState[i].narrow(1, 0, remove));
+                        v.initialModelState[i] = v.initialModelState[i].narrow(1, remove, s - remove);
                       }
                     }
-                    zeroGrad();
-                  } else {
-                    log("No members, zeroing grad\n");
-                    zeroGrad();
-                  }
 
-                  if (haveNewParameters) {
-                    log("Got new parameters, numUpdates %d -> %d\n", numUpdates_, newNumUpdates);
-                    haveNewParameters = false;
-                    numUpdates_ = newNumUpdates;
-
-                    if (modelParameters.size() != newParameters.size()) {
-                      throw std::runtime_error("Model parameters size mismatch in update!");
-                    }
-                    if (modelBuffers.size() != newBuffers.size()) {
-                      throw std::runtime_error("Model parameters size mismatch in update!");
-                    }
-
-                    for (size_t i = 0; i != modelParameters.size(); ++i) {
-                      modelParameters[i].copy_(newParameters[i], true);
-                    }
-                    for (size_t i = 0; i != modelBuffers.size(); ++i) {
-                      modelBuffers[i].copy_(newBuffers[i], true);
+                    n += s;
+                    if (n >= trainBatchSize) {
+                      break;
                     }
                   }
 
-                  if (isCuda) {
-                    streamGuard->current_stream().synchronize();
+                  index = 0;
+                  for (auto& [key, value] : input) {
+                    value = torch::cat(inputStack[index], 1);
+                    //log("train input [%s] = %s\n", key, sizesStr(value.sizes()));
+                    ++index;
+                  }
+                  index = 0;
+                  for (auto& [key, value] : outputMap) {
+                    value = torch::cat(outputStack[index], 1);
+                    //log("train output [%s] = %s\n", key, sizesStr(value.sizes()));
+                    ++index;
                   }
 
-                } else {
-                  Profile p("python step_optimizer");
-                  {
-                    py::gil_scoped_acquire gil;
-                    //log("optimizer %d\n", bufferIndex);
-                    learner_.attr("step_optimizer")();
-                    //log("optimizer %d done \n", bufferIndex);
+                  std::vector<torch::Tensor> initialState;
+                  index = 0;
+                  for (auto& v : initialStateStack) {
+                    initialState.push_back(torch::cat(v, 1));
+                    //log("train state [%d] = %s\n", index, sizesStr(initialState.back().sizes()));
+                    ++index;
                   }
+
+                  //log("train input prepared, trainQueue size is now %d\n", trainQueue.size());
+
+                  trainStep(input, outputMap, initialState, optimizeCounter++ % 2 == 0);
+                }
+
+              } else {
+
+                //std::lock_guard lm(modelMutex);
+                //log("Stepping buffer %d\n", bufferIndex);
+                index = 0;
+                for (auto& [key, value] : input) {
+                  //log("input [%s] = %s\n", key, sizesStr(value.sizes()));
+                  value = lbuf.inputDeviceSeq.at(index);
+                  ++index;
+                }
+                index = 0;
+                //log("lbuf.outputDeviceSeq.size() is %d\n", lbuf.outputDeviceSeq.size());
+                for (auto& [key, value] : outputMap) {
+                  //log("output [%s] = %s\n", key, sizesStr(value.sizes()));
+                  value = lbuf.outputDeviceSeq.at(index);
+                  ++index;
+                }
+
+                trainStep(input, outputMap, {}, bufferIndex == shared->buffers.size() - 1);
+
+                for (auto& v : ms) {
+                  v.detach_();
+                }
+                for (auto& v : lbuf.inputDeviceSeq) {
+                  v.detach_();
+                }
+                for (auto& v : lbuf.outputDeviceSeq) {
+                  v.detach_();
                 }
               }
 
-              p.stop();
-
-  //            float tt = mainTimer.elapsed();
-  //            auto ts = [&](float v) {
-  //              return fmt::sprintf("%g (%g%%)", v, v * 100 / tt);
-  //            };
-  //            std::string s;
-  //            std::lock_guard l(profileMutex);
-  //            for (auto& [key, value] : profileTimes) {
-  //              if (!s.empty()) {
-  //                s += " ";
-  //              }
-  //              s += key;
-  //              s += ": ";
-  //              s += ts(value);
-  //            }
-  //            log("total time: %g, %s\n", tt, s);
             } else {
               ++lbuf.currentSequenceIndex;
             }
           }
           lbuf.busy = false;
-        });
+        //});
+        }
+        if (gradMode == true) {
+          if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
+            while (lbuf.busy);
+          }
+        }
         if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
-          while (lbuf.busy);
+          float tt = mainTimer.elapsed();
+          auto ts = [&](float v) {
+            return fmt::sprintf("%g (%g%%)", v, v * 100 / tt);
+          };
+          std::string s;
+          std::lock_guard l(profileMutex);
+          for (auto& [key, value] : profileTimes) {
+            if (!s.empty()) {
+              s += " ";
+            }
+            s += key;
+            s += ": ";
+            s += ts(value);
+          }
+          log("total time: %g, %s\n", tt, s);
         }
       };
 
@@ -1653,7 +1852,7 @@ struct TestJob {
         break;
       }
 
-      count += batchSize;
+      count += actorBatchSize;
 
       if (t.elapsed() >= 1.0f) {
         float tx = t.elapsedReset();
@@ -1691,7 +1890,16 @@ struct TestClient {
   ~TestClient() {
     py::gil_scoped_release gil;
     terminate_ = true;
+    for (auto& v : batch) {
+      for (auto& v2 : v.envs) {
+        v2.terminate_ = true;
+      }
+    }
     runThread.join();
+  }
+
+  bool running() {
+    return runThread.joinable();
   }
 
   void start(std::string serverAddress) {
@@ -1959,7 +2167,7 @@ struct Broker {
         std::lock_guard l2(g.mutex);
         for (auto i = g.peers.begin(); i != g.peers.end();) {
           auto& p = i->second;
-          if (now - p.lastPing >= std::chrono::seconds(60)) {
+          if (now - p.lastPing >= std::chrono::seconds(15)) {
             log("Peer %s::%s timed out\n", g.name, p.name);
             if (p.active) {
               g.needsUpdate = true;
@@ -2002,5 +2210,6 @@ PYBIND11_MODULE(pyjob, m) {
       .def("get_name", &TestJob::getName);
   py::class_<TestClient>(m, "TestClient")
       .def(py::init<py::object>())
-      .def("start", &TestClient::start);
+      .def("start", &TestClient::start)
+      .def("running", &TestClient::running);
 }

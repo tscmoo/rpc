@@ -142,6 +142,14 @@ struct SharedBufferHandle {
   int decref() noexcept {
     return buffer_->refcount.fetch_sub(1, std::memory_order_release) - 1;
   }
+  Buffer* release() noexcept {
+    Buffer* r = buffer_;
+    buffer_ = nullptr;
+    return r;
+  }
+  void acquire(Buffer* buffer) noexcept {
+    buffer_ = buffer;
+  }
 };
 
 inline BufferHandle makeBuffer(size_t size, size_t nTensors) noexcept {

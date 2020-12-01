@@ -91,6 +91,7 @@ struct Rpc {
     //reqNotFound,
     reqLookingForPeer,
     reqPeerFound,
+    reqClose,
 
     reqCallOffset = 1000,
   };

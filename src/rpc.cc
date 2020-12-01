@@ -1,6 +1,7 @@
 #include "rpc.h"
 
 #include "network.h"
+#include "shm2.h"
 
 #include <tensorpipe/tensorpipe.h>
 #include <tensorpipe/transport/listener.h>
@@ -36,6 +37,7 @@ void log(const char* fmt, Args&&... args) {
   } else {
     fmt::printf("%s: %s\n", buf, s);
   }
+  fflush(stdout);
 }
 
 namespace {
@@ -51,7 +53,7 @@ auto seedRng() {
     (uint32_t)std::chrono::high_resolution_clock::now().time_since_epoch().count(),
     (uint32_t)(std::chrono::high_resolution_clock::now() - start).count(),
     (uint32_t)dev(),
-                     (uint32_t)(std::chrono::high_resolution_clock::now() - start).count(),
+    (uint32_t)(std::chrono::high_resolution_clock::now() - start).count(),
     (uint32_t)dev(),
     (uint32_t)dev(),
     (uint32_t)std::hash<std::thread::id>()(std::this_thread::get_id())
@@ -465,6 +467,7 @@ struct API_InProcess {
   static constexpr bool persistentRead = true;
   static constexpr bool persistentAccept = true;
   static constexpr bool addressIsIp = false;
+  static constexpr bool singularWrites = false;
 
   static std::vector<std::string> defaultAddr() {
     return {randomAddress()};
@@ -496,6 +499,7 @@ struct API_TPSHM {
   static constexpr bool persistentRead = false;
   static constexpr bool persistentAccept = false;
   static constexpr bool addressIsIp = false;
+  static constexpr bool singularWrites = true;
 
   static std::vector<std::string> defaultAddr() {
     return {randomAddress()};
@@ -530,6 +534,7 @@ struct API_TPUV {
   static constexpr bool persistentRead = false;
   static constexpr bool persistentAccept = false;
   static constexpr bool addressIsIp = true;
+  static constexpr bool singularWrites = true;
 
   static std::vector<std::string> defaultAddr() {
     return {"0.0.0.0", "::"};
@@ -564,6 +569,7 @@ struct API_TPIBV {
   static constexpr bool persistentRead = false;
   static constexpr bool persistentAccept = false;
   static constexpr bool addressIsIp = true;
+  static constexpr bool singularWrites = true;
 
   static std::vector<std::string> defaultAddr() {
     return {"0.0.0.0", "::"};
@@ -603,6 +609,41 @@ struct API_Network {
   }
 };
 
+struct API_SHM2 {
+  using Context = shm2::Context;
+  using Connection = std::unique_ptr<shm2::Connection>;
+  using Listener = std::unique_ptr<shm2::Listener>;
+
+  static constexpr bool supportsBuffer = true;
+  static constexpr bool persistentRead = false;
+  static constexpr bool persistentAccept = false;
+  static constexpr bool addressIsIp = false;
+  static constexpr bool singularWrites = false;
+
+  static std::vector<std::string> defaultAddr() {
+    return {randomAddress()};
+  }
+  static std::string localAddr([[maybe_unused]] const Listener& listener, std::string addr) {
+    return addr;
+  }
+  static std::string localAddr([[maybe_unused]] const Connection&) {
+    return "";
+  }
+  static std::string remoteAddr([[maybe_unused]] const Connection&) {
+    return "";
+  }
+
+  static auto& cast(Connection& x) {
+    return *x;
+  }
+  static auto& cast(Listener& x) {
+    return *x;
+  }
+  static std::string errstr(const shm2::Error* err) {
+    return err->what();
+  }
+};
+
 template<typename API>
 struct APIWrapper: API {
   template<typename T, typename X = API>
@@ -625,12 +666,14 @@ enum class ConnectionType {
   shm,
   ibv,
 //  inproc,
+//  shm2,
   count
 };
 static std::array<const char*, (int)ConnectionType::count> connectionTypeName = {
   "TCP/IP",
   "Shared memory",
   "InfiniBand",
+//  "Shared memory2",
 //  "In-process"
 };
 
@@ -638,6 +681,7 @@ template<typename API> struct index_t;
 template<> struct index_t<API_TPUV> { static constexpr ConnectionType value = ConnectionType::uv; };
 template<> struct index_t<API_TPSHM> { static constexpr ConnectionType value = ConnectionType::shm; };
 template<> struct index_t<API_TPIBV> { static constexpr ConnectionType value = ConnectionType::ibv; };
+//template<> struct index_t<API_SHM2> { static constexpr ConnectionType value = ConnectionType::shm2; };
 //template<> struct index_t<API_InProcess> { static constexpr ConnectionType value = ConnectionType::inproc; };
 template<typename API> constexpr size_t index = (size_t)index_t<API>::value;
 
@@ -653,6 +697,9 @@ auto switchOnAPI(ConnectionType t, F&& f) {
   case ConnectionType::ibv:
     return f(API_TPIBV{});
     break;
+//  case ConnectionType::shm2:
+//    return f(API_SHM2{});
+//    break;
 //  case ConnectionType::inproc:
 //    return f(API_InProcess{});
 //    break;
@@ -705,6 +752,7 @@ struct RpcConnectionImplBase {
   std::chrono::steady_clock::time_point lastReceivedData;
   bool isExplicit = false;
   std::string connectAddr;
+  std::chrono::steady_clock::time_point timeWait;
 };
 
 struct RpcListenerImplBase {
@@ -726,6 +774,8 @@ struct Connection {
   bool isExplicit = false;
   std::atomic<bool> hasConn = false;
   std::vector<std::unique_ptr<RpcConnectionImplBase>> conns;
+
+  std::chrono::steady_clock::time_point creationTimestamp = std::chrono::steady_clock::now();
 
   std::vector<std::string_view> remoteAddresses;
 
@@ -870,13 +920,17 @@ struct PeerImpl {
     }
   }
 
+  bool isConnected(const Connection& v) {
+    return v.valid.load(std::memory_order_relaxed) && v.hasConn.load(std::memory_order_relaxed);
+  }
+
   bool willConnectOrSend(const std::chrono::steady_clock::time_point& now, const Connection& v) {
     return v.valid.load(std::memory_order_relaxed) && (v.hasConn.load(std::memory_order_relaxed) || v.lastTryConnect.load(std::memory_order_relaxed) + std::chrono::seconds(30) <= now);
   }
 
   template<typename Buffer>
-  bool banditSend(uint32_t mask, Buffer buffer, size_t* indexUsed = nullptr, Me<RpcConnectionImplBase>* outConnection = nullptr) noexcept {
-    //log("banditSend %d bytes mask %#x\n", (int)buffer->size, mask);
+  bool banditSend(uint32_t mask, Buffer buffer, size_t* indexUsed = nullptr, Me<RpcConnectionImplBase>* outConnection = nullptr, bool shouldFindPeer = true) noexcept {
+    log("banditSend %d bytes mask %#x\n", (int)buffer->size, mask);
     auto now = std::chrono::steady_clock::now();
     thread_local std::vector<std::pair<size_t, float>> list;
     list.clear();
@@ -888,7 +942,7 @@ struct PeerImpl {
       auto& v = connections_[i];
       if (willConnectOrSend(now, v)) {
         float score = std::exp(v.readBanditValue * 4);
-        //log("bandit %s has score %g\n", connectionTypeName[i], score);
+        log("bandit %s has score %g\n", connectionTypeName[i], score);
         sum += score;
         list.emplace_back(i, sum);
       }
@@ -903,7 +957,7 @@ struct PeerImpl {
           return a.second < b;
         })->first;
       }
-      //log("bandit chose %d (%s)\n", index, connectionTypeName.at(index));
+      log("bandit chose %d (%s)\n", index, connectionTypeName.at(index));
       auto& x = connections_.at(index);
       x.sendCount.fetch_add(1, std::memory_order_relaxed);
       bool b = switchOnAPI((ConnectionType)index, [&](auto api) {
@@ -918,9 +972,11 @@ struct PeerImpl {
       }
       return b;
     } else {
-      //log("No connectivity to %s\n", name);
+      log("No connectivity to %s\n", name);
 
-      findPeer();
+      if (shouldFindPeer) {
+        findPeer();
+      }
       return false;
     }
   }
@@ -952,7 +1008,7 @@ struct PeerImpl {
         }
         l.unlock();
         if (!addr.empty()) {
-          //log("connecting to %s!! :D\n", addr);
+          log("connecting to %s::%s!! :D\n", connectionTypeName[index<API>], addr);
           connect<API, false>(addr);
         }
       }
@@ -964,7 +1020,10 @@ struct PeerImpl {
       size_t i = threadRandom<size_t>(0, x.conns.size() - 1);
       auto& c = x.conns[i];
       if (c->dead.load(std::memory_order_relaxed) || now - c->lastReceivedData >= std::chrono::seconds(15)) {
-        //log("Connection through %s to %s is dead, yo!\n", connectionTypeName[index<API>], name);
+        log("Connection through %s to %s is dead, yo!\n", connectionTypeName[index<API>], name);
+        BufferHandle buffer;
+        serializeToBuffer(buffer, (uint32_t)0, (uint32_t)Rpc::reqClose);
+        ((RpcConnectionImpl<API>&)*c).send(std::move(buffer));
         throwAway(x, i);
         if (outConnection) {
           *outConnection = nullptr;
@@ -987,6 +1046,7 @@ struct PeerImpl {
     if (x.conns.empty()) {
       x.hasConn = false;
     }
+    cv->timeWait = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     throwAway(std::move(cv));
   }
 
@@ -1011,9 +1071,21 @@ struct RpcConnectionImpl : RpcConnectionImplBase {
   mutable std::string localAddrStr_;
   mutable std::string remoteAddrStr_;
 
+  SpinMutex sendMutex;
+  Buffer* sendQueueBegin = nullptr;
+  Buffer* sendQueueEnd = nullptr;
+
   ~RpcConnectionImpl() {
     close();
     while (activeOps.load(std::memory_order_acquire));
+
+    if constexpr (API::singularWrites) {
+      for (Buffer* buf = sendQueueBegin; buf;) {
+        SharedBufferHandle h;
+        h.acquire(buf);
+        buf = buf->next;
+      }
+    }
   }
 
   virtual const std::string& localAddr() const override {
@@ -1047,17 +1119,17 @@ struct RpcConnectionImpl : RpcConnectionImplBase {
     if (dead.exchange(true, std::memory_order_relaxed)) {
       return;
     }
-    //rpc.log("Connection %s closed\n", connectionTypeName[index<API>]);
+    rpc.log("Connection %s closed\n", connectionTypeName[index<API>]);
     dead = true;
     API::cast(connection).close();
   }
 
   void onError([[maybe_unused]] Error* err) {
-    //rpc.log("Connection %s error: %s\n", connectionTypeName[index<API>], err->what());
+    rpc.log("Connection %s to %s error: %s\n", connectionTypeName[index<API>], connectAddr, err->what());
     close();
   }
   void onError([[maybe_unused]] const char* err) {
-    //rpc.log("Connection %s error: %s\n", connectionTypeName[index<API>], err);
+    rpc.log("Connection %s error: %s\n", connectionTypeName[index<API>], err);
     close();
   }
 
@@ -1070,7 +1142,7 @@ struct RpcConnectionImpl : RpcConnectionImplBase {
   static constexpr uint64_t kSignature = 0xff984b883019d443;
 
   void onData(const std::byte* ptr, size_t len) noexcept {
-    //log("got %d bytes\n", len);
+    log("%s :: got %d bytes\n", connectionTypeName[index<API>], len);
     if (len < sizeof(uint32_t) * 2) {
       onError("Received not enough data");
       return;
@@ -1128,9 +1200,9 @@ struct RpcConnectionImpl : RpcConnectionImplBase {
   }
 
   void read(Me<RpcConnectionImpl>&& me) {
-    //log("read %p\n", this);
+    log("read %s :: %p\n", connectionTypeName[index<API>], (void*)this);
     API::cast(connection).read([me = std::move(me)](auto&& error, auto&&... args) mutable noexcept {
-      //log("%p got data\n");
+      log("%s :: %p got data\n", connectionTypeName[index<API>], (void*)&*me);
       if (me->dead.load(std::memory_order_relaxed)) {
         if constexpr (API::persistentRead) {
           return false;
@@ -1158,29 +1230,73 @@ struct RpcConnectionImpl : RpcConnectionImplBase {
     read(makeMe(this));
   }
 
+  struct WriteCallback {
+    WriteCallback(RpcConnectionImpl* me) : me(me) {}
+    Me<RpcConnectionImpl> me;
+    template<typename Error>
+    void operator()(Error&& error) {
+      if (error) {
+        me->onError(std::forward<Error>(error));
+      } else {
+        if constexpr (API::singularWrites) {
+          std::unique_lock l(me->sendMutex);
+          SharedBufferHandle h;
+          h.acquire(me->sendQueueBegin);
+          log("%s: write success for %d bytes\n", connectionTypeName[index<API>], h->size);
+          me->sendQueueBegin = me->sendQueueBegin->next;
+          if (!me->sendQueueBegin) {
+            me->sendQueueEnd = nullptr;
+          }
+          Buffer* buf = me->sendQueueBegin;
+          l.unlock();
+          if (buf) {
+            auto* ptr = buf->data();
+            size_t size = buf->size;
+            log("next buf is %d bytes\n", size);
+            auto& conn = me->connection;
+            API::cast(conn).write(ptr, size, std::move(*this));
+          } else {
+            log("next buf is null\n");
+          }
+        }
+      }
+    }
+  };
+
   template<typename Buffer>
   void send(Buffer buffer) {
-    auto* ptr = buffer->data();
-    size_t size = buffer->size;
-    //log("%p :: send %d bytes\n", (void*)this, size);
+    log("%s :: send %d bytes\n", connectionTypeName[index<API>], buffer->size);
 //    if (random(0, 1) == 0) {
 //      return;
 //    }
-    if constexpr (API::supportsBuffer) {
-      BufferHandle hx = makeBuffer(buffer->size, 0);
-      hx->size = buffer->size;
-      std::memcpy(hx->data(), buffer->data(), hx->size);
-      API::cast(connection).write(std::move(hx), [me = Me<RpcConnectionImpl>(this)](auto&& error) mutable {
-        if (error) {
-          me->onError(error);
+    if (API::singularWrites) {
+      auto shared = [&](auto&& v) {
+        if constexpr (std::is_same_v<std::decay_t<Buffer>, SharedBufferHandle>) {
+          return std::move(v);
+        } else if constexpr (std::is_same_v<std::decay_t<Buffer>, BufferHandle>) {
+          return SharedBufferHandle(v.release());
+        } else {
+          std::abort();
         }
-      });
+      };
+      auto* buf = shared(std::move(buffer)).release();
+      std::unique_lock l(sendMutex);
+      if (sendQueueEnd) {
+        sendQueueEnd->next = buf;
+        sendQueueEnd = buf;
+        buf->next = nullptr;
+      } else {
+        sendQueueBegin = sendQueueEnd = buf;
+        buf->next = nullptr;
+        l.unlock();
+        auto* ptr = buf->data();
+        size_t size = buf->size;
+        API::cast(connection).write(ptr, size, WriteCallback(this));
+      }
     } else {
-      API::cast(connection).write(ptr, size, [buffer = std::move(buffer), me = Me<RpcConnectionImpl>(this)](auto&& error) mutable {
-        if (error) {
-          me->onError(error);
-        }
-      });
+      auto* ptr = buffer->data();
+      size_t size = buffer->size;
+      API::cast(connection).write(ptr, size, WriteCallback(this));
     }
   }
 
@@ -1246,6 +1362,28 @@ struct RpcListenerImpl : RpcListenerImplBase {
 //  delete ptr;
 //}
 
+namespace {
+template<typename T>
+void listInsert(T* at, T* item) {
+  T* next = at;
+  T* prev = at->prev;
+  next->prev = item;
+  prev->next = item;
+  item->next = next;
+  item->prev = prev;
+}
+template<typename T>
+void listErase(T* at) {
+  T* next = at->next;
+  T* prev = at->prev;
+  next->prev = prev;
+  prev->next = next;
+
+  at->prev = nullptr;
+  at->next = nullptr;
+}
+}
+
 struct RpcImplBase {
   Rpc::Impl& rpc;
   RpcImplBase(Rpc::Impl& rpc) : rpc(rpc) {}
@@ -1303,6 +1441,7 @@ struct Rpc::Impl {
     std::chrono::steady_clock::time_point timeout;
     Receive recv;
 
+    std::chrono::steady_clock::time_point creationTimestamp = std::chrono::steady_clock::now();
     Resend resend;
     std::vector<Resend> resendTensors;
     size_t partsAcked = 0;
@@ -1333,8 +1472,9 @@ struct Rpc::Impl {
     Rpc::ResponseCallback response;
     PeerImpl* peer = nullptr;
     int timeoutCount = 0;
-    std::vector<Resend> resendTensors;
+    std::chrono::steady_clock::time_point creationTimestamp = std::chrono::steady_clock::now();
     Resend resend;
+    std::vector<Resend> resendTensors;
     size_t partsAcked = 0;
 
     Receive recv;
@@ -1394,6 +1534,12 @@ struct Rpc::Impl {
 
   template<typename API>
   void tryInitRpc() {
+    if (index<API> == (size_t)ConnectionType::ibv) {
+      return;
+    }
+//    if (index<API> == (size_t)ConnectionType::shm) {
+//      return;
+//    }
     try {
       printf("init %s\n", connectionTypeName[index<API>]);
       auto u = std::make_unique<RpcImpl<API>>(*this);
@@ -1470,18 +1616,27 @@ struct Rpc::Impl {
       return newTimeout;
     }
     if (s.connection) {
-      if (!s.hasAddedFailureLatency && now - s.lastSendTimestamp >= std::chrono::seconds(1)) {
+      if (!s.hasAddedFailureLatency && now - s.lastSendTimestamp >= std::chrono::milliseconds(1000)) {
         s.hasAddedFailureLatency = true;
+        log("  -- rid %#x to %s   %s failed \n", o.rid, o.peer->name, connectionTypeName.at(s.connectionIndex));
         switchOnAPI((ConnectionType)s.connectionIndex, [&](auto api) {
           addLatency<decltype(api)>(*o.peer, now, std::chrono::seconds(1));
         });
+        fflush(stdout);
+        std::exit(1);
+        std::abort();
       }
       if (now - s.connection->lastReceivedData >= std::chrono::seconds(8)) {
-        //log("Closing connection %s to %s due to timeout!\n", connectionTypeName.at(s.connectionIndex), o.peer->name);
+        log("Closing connection %s to %s due to timeout!\n", connectionTypeName.at(s.connectionIndex), o.peer->name);
         auto& x = o.peer->connections_.at(s.connectionIndex);
         std::lock_guard l(x.mutex);
         for (size_t i = 0; i != x.conns.size(); ++i) {
           if (&*x.conns[i] == &*s.connection) {
+            BufferHandle buffer;
+            serializeToBuffer(buffer, (uint32_t)0, (uint32_t)Rpc::reqClose);
+            switchOnAPI((ConnectionType)s.connectionIndex, [&](auto api) {
+              ((RpcConnectionImpl<decltype(api)>&)*x.conns[i]).send(std::move(buffer));
+            });
             o.peer->throwAway(x, i);
             break;
           }
@@ -1494,12 +1649,12 @@ struct Rpc::Impl {
       s.acked = false;
     }
     if (s.pokeCount < 2) {
-      //log("timeout sending poke for rid %#x part %d (destined for %s)\n", o.rid, partIndex, o.peer->name);
+      log("timeout sending poke for rid %#x part %d (destined for %s)\n", o.rid, partIndex, o.peer->name);
       BufferHandle buffer;
       serializeToBuffer(buffer, o.rid, Rpc::reqPoke, partIndex);
       size_t index;
       bool b = o.peer->banditSend(~0, std::move(buffer), &index);
-      //log("timeout bandit send result: %d\n", b);
+      log("timeout bandit send result: %d\n", b);
       if (b) {
         if (s.pokeCount == 0) {
           s.pokeTimestamp = now;
@@ -1535,14 +1690,14 @@ struct Rpc::Impl {
   }
 
   template<typename L, typename T>
-  void collect(L& lock, T& ref) noexcept {
+  void collect(L& lock, T& ref, bool respectTimeWait = false) noexcept {
     if (!ref.empty()) {
+      auto now = std::chrono::steady_clock::now();
       thread_local T tmp;
       std::swap(ref, tmp);
       lock.unlock();
       for (auto& v : tmp) {
         if constexpr (std::is_same_v<std::remove_reference_t<decltype(v)>, std::unique_ptr<RpcConnectionImplBase>>) {
-          //log("collecting connection %s <-> %s\n", v->localAddr(), v->remoteAddr());
 
           auto checkBucket = [&](auto& bucket) {
             std::lock_guard l(bucket.mutex);
@@ -1559,13 +1714,20 @@ struct Rpc::Impl {
             checkBucket(bucket);
           }
 
-        }
-        if constexpr (std::is_same_v<std::remove_reference_t<decltype(v)>, std::unique_ptr<RpcConnectionImplBase>>) {
-          if (v->isExplicit) {
-            switchOnAPI((ConnectionType)v->apiIndex(), [&](auto api) {
-              log("Reconnecting to %s...\n", v->connectAddr);
-              connect<decltype(api)>(v->connectAddr);
-            });
+          if (respectTimeWait && now < v->timeWait) {
+            log("time wait %s connection %s <-> %s\n", connectionTypeName.at(v->apiIndex()), v->localAddr(), v->remoteAddr());
+            lock.lock();
+            ref.push_back(std::move(v));
+            lock.unlock();
+          } else {
+            log("collecting %s connection %s <-> %s\n", connectionTypeName.at(v->apiIndex()), v->localAddr(), v->remoteAddr());
+
+            if (v->isExplicit) {
+              switchOnAPI((ConnectionType)v->apiIndex(), [&](auto api) {
+                log("Reconnecting to %s...\n", v->connectAddr);
+                connect<decltype(api)>(v->connectAddr);
+              });
+            }
           }
         }
       }
@@ -1575,9 +1737,24 @@ struct Rpc::Impl {
     }
   }
 
+  void collectFloatingConnections(std::chrono::steady_clock::time_point now) {
+    for (auto i = floatingConnections_.begin(); i != floatingConnections_.end();) {
+      auto& c = *i;
+      if (now - c->creationTimestamp >= std::chrono::seconds(10)) {
+        log("Collecting floating connection\n");
+        for (auto& v2 : c->conns) {
+          garbageConnections_.push_back(std::move(v2));
+        }
+        i = floatingConnections_.erase(i);
+      } else {
+        ++i;
+      }
+    }
+  }
+
   void collectGarbage() {
     std::unique_lock l(garbageMutex_);
-    collect(l, garbageConnections_);
+    collect(l, garbageConnections_, true);
     collect(l, garbageListeners_);
   }
 
@@ -1585,49 +1762,109 @@ struct Rpc::Impl {
     async::setCurrentThreadName("timeout");
     //std::this_thread::sleep_for(std::chrono::milliseconds(250));
     //log("timeout thread running (%s)!\n", std::string(myName).c_str());
+    auto lastP = std::chrono::steady_clock::now();
     while (!terminate_.load(std::memory_order_relaxed)) {
       auto now = std::chrono::steady_clock::now();
       if (lastRanMisc.load() + std::chrono::milliseconds(750) <= now) {
         lastRanMisc.store(now);
+        collectFloatingConnections(now);
         collectGarbage();
         findPeersImpl();
         now = std::chrono::steady_clock::now();
       }
+
       auto timeout = timeout_.load(std::memory_order_relaxed);
-      //log("timeout is in %d\n", std::chrono::duration_cast<std::chrono::milliseconds>(timeout - now).count());
-      if (now < timeout) {
-        //log("%p sleeping for %d\n", (void*)this, std::chrono::duration_cast<std::chrono::milliseconds>(timeout - now).count());
+      log("timeout is in %d\n", std::chrono::duration_cast<std::chrono::milliseconds>(timeout - now).count());
+      while (now < timeout) {
+        log("%p sleeping for %d\n", (void*)this, std::chrono::duration_cast<std::chrono::milliseconds>(timeout - now).count());
+        if (timeout - now > std::chrono::milliseconds(250)) {
+          timeout = now + std::chrono::milliseconds(250);
+        }
         timeoutSem_.wait_for(timeout - now);
-        //log("%p woke up\n", (void*)this);
+        log("%p woke up\n", (void*)this);
+        now = std::chrono::steady_clock::now();
+        if (now - lastP >= std::chrono::milliseconds(200)) {
+          lastP = now;
+          if (true) {
+            std::lock_guard l(peersMutex_);
+            for (auto& v : peers_) {
+              auto& p = v.second;
+              std::lock_guard l(p.idMutex_);
+              log("Peer %s (%s)\n", std::string(p.name).c_str(), p.id.toString().c_str());
+              for (size_t i = 0; i != p.connections_.size(); ++i) {
+                auto& x = p.connections_[i];
+                log(" %s x%d  latency %g bandit %g\n", connectionTypeName[i], x.sendCount.load(std::memory_order_relaxed), x.runningLatency.load(), x.readBanditValue.load());
+                log("    %d conns:\n", x.conns.size());
+                for (auto& v : x.conns) {
+                  float t = std::chrono::duration_cast<std::chrono::duration<float, std::ratio<1, 1>>>(now - v->lastReceivedData).count();
+                  log("      %s (%s, %s) [%s] age %g\n", v->dead ? "dead" : "alive", v->localAddr(), v->remoteAddr(), v->connectAddr, t);
+                }
+              }
+            }
+          }
+        }
         continue;
       }
       auto newTimeout = now + std::chrono::seconds(5);
       timeout_.store(newTimeout);
-      for (auto& b : outgoing_) {
-        std::lock_guard l(b.mutex);
-        for (auto& v : b.map) {
-          if (v.second.resend.buffer) {
-            if (now >= v.second.timeout) {
-              processTimeout(now, v.second);
+      auto process = [&](auto& container) {
+        auto absTimeoutDuration = std::chrono::seconds(60);
+        for (auto& b : container) {
+          std::unique_lock l(b.mutex);
+          bool anyToRemove = false;
+          for (auto& v : b.map) {
+            if (now - v.second.creationTimestamp >= absTimeoutDuration) {
+              anyToRemove = true;
             }
-            newTimeout = std::min(newTimeout, v.second.timeout);
+            if (v.second.resend.buffer) {
+              if (now >= v.second.timeout) {
+                processTimeout(now, v.second);
+              }
+              newTimeout = std::min(newTimeout, v.second.timeout);
+            }
+
+            constexpr bool isIncoming = std::is_same_v<std::decay_t<decltype(v.second)>, Incoming>;
+            float t = std::chrono::duration_cast<std::chrono::duration<float, std::ratio<1, 1>>>(now - v.second.creationTimestamp).count();
+            if constexpr (isIncoming) {
+              log("Response %#x age: %g\n", v.second.rid, t);
+            } else {
+              log("Request %#x age: %g\n", v.second.rid, t);
+            }
+          }
+          if (anyToRemove) {
+            std::unique_lock l2(incomingFifoMutex_, std::defer_lock);
+            constexpr bool isIncoming = std::is_same_v<std::decay_t<decltype(b.map.begin()->second)>, Incoming>;
+            if (isIncoming) {
+              if (!l2.try_lock()) {
+                l.unlock();
+                l2.lock();
+                l.lock();
+              }
+            }
+            for (auto i = b.map.begin(); i != b.map.end();) {
+              auto& v = i->second;
+              if (now - v.creationTimestamp >= absTimeoutDuration) {
+                if constexpr (isIncoming) {
+                  if (v.resend.buffer) {
+                    listErase(&v);
+                  }
+                  log("Response %#x timed out for real\n", v.rid);
+                } else {
+                  log("Request %#x timed out for real\n", v.rid);
+                }
+                i = b.map.erase(i);
+              } else {
+                ++i;
+              }
+            }
           }
         }
-      }
-      for (auto& b : incoming_) {
-        std::lock_guard l(b.mutex);
-        for (auto& v : b.map) {
-          if (v.second.resend.buffer) {
-            if (now >= v.second.timeout) {
-              processTimeout(now, v.second);
-            }
-            newTimeout = std::min(newTimeout, v.second.timeout);
-          }
-        }
-      }
+      };
+      process(outgoing_);
+      process(incoming_);
       timeout = timeout_.load(std::memory_order_relaxed);
       while (newTimeout < timeout && !timeout_.compare_exchange_weak(timeout, newTimeout));
-      //log("new timeout is in %d\n", std::chrono::duration_cast<std::chrono::milliseconds>(newTimeout - now).count());
+      log("new timeout is in %d\n", std::chrono::duration_cast<std::chrono::milliseconds>(newTimeout - now).count());
 
 
       if (now - lastPrint >= std::chrono::seconds(30)) {
@@ -1728,7 +1965,7 @@ struct Rpc::Impl {
 
   template<typename API, bool explicit_ = true>
   void connect(std::string_view addr) {
-    //log("Connecting with %s to %s\n", connectionTypeName[index<API>], addr);
+    log("Connecting with %s to %s\n", connectionTypeName[index<API>], addr);
     lazyInitRpc<API>();
     auto* u = getImpl<API>();
     if (!u) {
@@ -1745,6 +1982,7 @@ struct Rpc::Impl {
     c->outgoing = true;
     c->isExplicit = explicit_;
     c->addr = persistentString(addr);
+    RpcConnectionImpl<API> xx(*u, u->context.connect(std::string(addr)));
     auto cu = std::make_unique<RpcConnectionImpl<API>>(*u, u->context.connect(std::string(addr)));
     cu->isExplicit = explicit_;
     cu->connectAddr = addr;
@@ -1871,7 +2109,7 @@ struct Rpc::Impl {
     }
     auto now = std::chrono::steady_clock::now();
     {
-      //log("send request %#x %#x\n", rid, fid);
+      log("send request %#x %s::%#x\n", rid, peer.name, fid);
 //      if (conn.dead.load(std::memory_order_relaxed)) {
 //        Error err("RPC call: connection is closed");
 //        std::move(response)(nullptr, 0, &err);
@@ -1896,7 +2134,6 @@ struct Rpc::Impl {
       q.requestTimestamp = now;
       q.timeout = now + std::chrono::milliseconds(100);
       q.response = std::move(response);
-
       q.resend.buffer = shared;
       resend(peer, q.resend);
 
@@ -1945,6 +2182,7 @@ struct Rpc::Impl {
   }
 
   void sendRequest(std::string_view peerName, std::string_view functionName, BufferHandle buffer, ResponseCallback response) noexcept {
+    log("sendRequest %s::%s %d bytes\n", peerName, functionName, buffer->size);
     auto& peer = getPeer(peerName);
     uint32_t fid = peer.functionId(functionName);
     if (fid == 0) {
@@ -2172,7 +2410,7 @@ struct Rpc::Impl {
         for (auto& v : b.map) {
           auto& o = v.second;
           if (o.peer == &peer && !o.resend.connection) {
-            //log("poking on newly established connection\n");
+            log("poking on newly established connection\n");
             BufferHandle buffer;
             serializeToBuffer(buffer, o.rid, Rpc::reqPoke, o.resend.acked, (uint32_t)0);
             conn.send(std::move(buffer));
@@ -2221,7 +2459,7 @@ struct Rpc::Impl {
         return true;
       }
       for (auto& v : p->connections_) {
-        if (p->willConnectOrSend(now, v)) {
+        if (p->isConnected(v)) {
           return false;
         }
       }
@@ -2242,13 +2480,13 @@ struct Rpc::Impl {
         std::swap(peerList.back(), peerList.at(threadRandom<size_t>(0, peerList.size() - 1)));
         peerList.pop_back();
       }
-      //log("looking among %d peers\n", peerList.size());
+      log("looking among %d peers\n", peerList.size());
       BufferHandle buffer;
       serializeToBuffer(buffer, (uint32_t)1, (uint32_t)Rpc::reqLookingForPeer, nameList);
       SharedBufferHandle shared{buffer.release()};
       for (auto* p : peerList) {
         p->lastFindPeers = now;
-        anySuccess |= p->banditSend(~0, shared);
+        anySuccess |= p->banditSend(~0, shared, nullptr, nullptr, false);
       }
     }
 
@@ -2285,6 +2523,8 @@ struct Rpc::Impl {
 
     //float latency = std::min(us, (uint64_t)1000) / 100.0f + std::min(us / 1000.0f, 1000.0f);
     float latency = std::min(us / 1000.0f, 10000.0f);
+
+    log("add latency: connection %s part %d, latency %g\n", connectionTypeName[index<API>], partIndex, latency);
 
     if (latency >= 500) {
       //log("WARNING: connection %s part %d us is %lld, latency is %g\n", connectionTypeName[index<API>], partIndex, us, latency);
@@ -2332,28 +2572,6 @@ struct Rpc::Impl {
 
 };
 
-namespace {
-template<typename T>
-void listInsert(T* at, T* item) {
-  T* next = at;
-  T* prev = at->prev;
-  next->prev = item;
-  prev->next = item;
-  item->next = next;
-  item->prev = prev;
-}
-template<typename T>
-void listErase(T* at) {
-  T* next = at->next;
-  T* prev = at->prev;
-  next->prev = prev;
-  prev->next = next;
-
-  at->prev = nullptr;
-  at->next = nullptr;
-}
-}
-
 template<typename API>
 struct RpcImpl : RpcImplBase {
   typename API::Context context;
@@ -2376,7 +2594,7 @@ struct RpcImpl : RpcImplBase {
     std::unique_lock l(bucket.mutex);
     auto i = bucket.map.find(rid);
     if (i == bucket.map.end()) {
-      //log("got poke for unknown rid, nack %d\n", partIndex);
+      log("got poke for unknown rid, nack %d\n", partIndex);
       BufferHandle buffer;
       //serializeToBuffer(buffer, rid, Rpc::reqNotFound);
       serializeToBuffer(buffer, rid, Rpc::reqNack, partIndex);
@@ -2406,7 +2624,7 @@ struct RpcImpl : RpcImplBase {
         }
         l.unlock();
       }
-      //log("got poke %s %d\n", ack ? "ack" : "nack", partIndex);
+      log("got poke %s %d\n", ack ? "ack" : "nack", partIndex);
       BufferHandle buffer;
       serializeToBuffer(buffer, rid, ack ? Rpc::reqAck : Rpc::reqNack, partIndex);
       conn.send(std::move(buffer));
@@ -2481,6 +2699,7 @@ struct RpcImpl : RpcImplBase {
     std::memcpy(inbuffer->data(), ptr, len);
     inbuffer->size = len;
     if (!isTensor) {
+      log("recv part 0 of rid %#x\n", rid);
       BufferHandle buffer;
       serializeToBuffer(buffer, rid, Rpc::reqAck, (uint32_t)0);
       conn.send(std::move(buffer));
@@ -2512,6 +2731,8 @@ struct RpcImpl : RpcImplBase {
       uint32_t offset;
       std::string_view data;
       deserializeBuffer(inbuffer, tensorIndex, offset, data);
+
+      log("recv part %d of rid %#x\n", 1 + tensorIndex, rid);
 
       BufferHandle buffer;
       serializeToBuffer(buffer, rid, Rpc::reqAck, 1 + tensorIndex);
@@ -2576,7 +2797,7 @@ struct RpcImpl : RpcImplBase {
         }
         auto& s = partIndex == 0 ? x.resend : x.resendTensors[partIndex - 1];
         if (!s.acked) {
-          //log("handleAck got ack for part %d\n", partIndex);
+          log("handleAck got ack for part %d\n", partIndex);
           s.nackCount = 0;
           s.acked = true;
           s.ackTimestamp = now;
@@ -2610,7 +2831,7 @@ struct RpcImpl : RpcImplBase {
   void handleNack(T& container, PeerImpl& peer, RpcConnectionImpl<API>& conn, uint32_t rid, const std::byte* ptr, size_t len) {
     uint32_t partIndex = 0;
     deserializeBuffer(ptr, len, partIndex);
-    //log("got nack %d\n", partIndex);
+    log("got nack %d\n", partIndex);
     auto& bucket = rpc.getBucket(container, rid);
     std::unique_lock l(bucket.mutex);
     auto i = bucket.map.find(rid);
@@ -2627,20 +2848,19 @@ struct RpcImpl : RpcImplBase {
       auto& s = partIndex == 0 ? x.resend : x.resendTensors[partIndex - 1];
       if (s.buffer) {
         ++s.nackCount;
-        //log("nackCount is now %d\n", s.nackCount);
-        if (s.nackCount >= 4) {
-          //log("nack resend\n");
-          //std::abort();
-          if (!s.connection) {
-            rpc.resend(peer, s);
-          }
+        log("nackCount is now %d\n", s.nackCount);
+        if (!s.connection) {
+          log("nack resend\n");
+          rpc.resend(peer, s);
+        } else {
+          log("nack but resend already in progress\n");
         }
       }
     }
   }
 
   void onRequest(PeerImpl& peer, RpcConnectionImpl<API>& conn, uint32_t rid, uint32_t fid, const std::byte* ptr, size_t len) noexcept {
-    //log("onRequest rid %#x fid %#x  from %s\n", rid, fid, peer.name);
+    log("onRequest rid %#x fid %#x  from %s\n", rid, fid, peer.name);
     rid &= ~(uint32_t)1;
     switch (fid) {
     case Rpc::reqFindFunction: {
@@ -2838,9 +3058,21 @@ struct RpcImpl : RpcImplBase {
   }
 
   void onResponse(PeerImpl& peer, RpcConnectionImpl<API>& conn, uint32_t rid, uint32_t fid, const std::byte *ptr, size_t len) noexcept {
-    //log("onResponse rid %#x fid %#x  from %s\n", rid, fid, peer.name);
+    log("onResponse rid %#x fid %#x  from %s\n", rid, fid, peer.name);
     rid |= 1;
     switch (fid) {
+    case Rpc::reqClose: {
+      log("got reqClose\n");
+      auto& x = peer.connections_.at(index<API>);
+      std::lock_guard l(x.mutex);
+      for (size_t i = 0; i != x.conns.size(); ++i) {
+        if (&*x.conns[i] == &conn) {
+          peer.throwAway(x, i);
+          break;
+        }
+      }
+      break;
+    }
     case Rpc::reqPoke: {
       handlePoke(rpc.outgoing_, peer, conn, rid, ptr, len);
       break;
@@ -2903,10 +3135,11 @@ struct RpcImpl : RpcImplBase {
             std::terminate();
           }
           if (i != oBucket.map.end() && i->second.peer == &peer) {
+            log("got response for rid %#x from %s\n", rid, peer.name);
             response = std::move(i->second.response);
             oBucket.map.erase(i);
           } else {
-            //log("got response for unknown rid %#x from %s\n", rid, peer.name);
+            log("got response for unknown rid %#x from %s\n", rid, peer.name);
           }
         }
         if (response) {
@@ -2982,7 +3215,11 @@ std::pair<std::string_view, std::string_view> splitUri(std::string_view uri) {
   while (i != e) {
     if (*i == ':') {
       ++i;
-      return {std::string_view(uri.begin(), i - 1 - s), std::string_view(i, e - i)};
+      if (i != e && i + 1 != e && *i == '/' && i[1] == '/') {
+        return {std::string_view(uri.begin(), i - 1 - s), std::string_view(i + 2, e - (i + 2))};
+      } else {
+        return {std::string_view(uri.begin(), i - 1 - s), std::string_view(i, e - i)};
+      }
     }
     if (!std::islower(*i)) {
       break;
