@@ -420,7 +420,7 @@ struct Shared {
   };
 
   alignas(64) std::atomic_int clients = 0;
-  std::array<Buffer, 2> buffers;
+  std::array<Buffer, 1> buffers;
 
 
   std::byte* allocateNonAligned(size_t n) {
@@ -637,15 +637,24 @@ struct Env {
         done = false;
         reward = 0.0f;
         obs = reset_();
+        //env_.attr("render")();
+        //std::this_thread::sleep_for(std::chrono::milliseconds(1000));
       } else {
+        log("step action %d\n", action);
         py::tuple tup = step_(action);
         obs = tup[0];
         reward = (py::float_)tup[1];
         done = (py::bool_)tup[2];
         localEpisodeReturn = episodeReturn += reward;
         localEpisodeStep = ++episodeStep;
+        //env_.attr("render")();
+        //log("local step %d\n", localEpisodeStep);
+        //std::this_thread::sleep_for(std::chrono::milliseconds(50));
         if (done) {
+          log("episode done after %d steps with %g total reward\n", episodeStep, episodeReturn);
           obs = reset_();
+          std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+          env_.attr("render")();
           episodeStep = 0;
           episodeReturn = 0;
         }
@@ -888,7 +897,8 @@ struct TestJob {
   std::deque<LocalBuffer> local;
 
   size_t trainBatchSize = 256;
-  size_t actorBatchSize = 1024;
+  size_t actorBatchSize = 1;
+  size_t optimizerBatchSize = 2;
 
   template<typename T, typename... Args>
   Future<T> call(std::string_view peerName, std::string_view funcName, Args&&... args) {
@@ -1011,7 +1021,7 @@ struct TestJob {
     terminate_ = true;
     //shared->doneSem.post();
     //log("Note: Hackily quick-exiting\n");
-    std::quick_exit(1);
+    //std::quick_exit(1);
     py::gil_scoped_release gil;
     runThread.join();
   }
@@ -1067,11 +1077,177 @@ struct TestJob {
     return s;
   }
 
+  void zeroGrad() {
+    for (auto& v : modelParameters) {
+      auto& grad = v.grad();
+      if (grad.defined()) {
+        grad.detach_();
+        grad.zero_();
+      }
+    }
+  }
+
+  void optimizerStep() {
+    torch::AutoGradMode ng(false);
+    if (isCuda) {
+      if (!trainCudaStream) {
+        trainCudaStream = c10::cuda::getStreamFromPool(false, device.index());
+      }
+      c10::cuda::set_device(device.index());
+      c10::cuda::setCurrentCUDAStream(*trainCudaStream);
+    }
+    std::unique_lock l(syncMutex);
+
+    if (!members_.empty()) {
+      std::string_view master = members_.front();
+      if (master == myName) {
+        if (syncedGrads.empty()) {
+          for (auto& v : modelParameters) {
+            auto& grad = v.grad();
+            if (grad.defined()) {
+              syncedGrads.push_back(torch::zeros_like(grad, torch::TensorOptions(torch::kCPU).pinned_memory(true)));
+            }
+          }
+        } else {
+          log("Adding in %d gradients\n", numSyncedGradients);
+          if (numSyncedGradients) {
+            size_t i = 0;
+            for (auto& v : modelParameters) {
+              auto& grad = v.grad();
+              if (grad.defined()) {
+                if (i == syncedGrads.size()) {
+                  throw std::runtime_error("grads grew?");
+                }
+//                grad.add_(syncedGrads[i].to(device, true));
+//                grad.mul_(1.0f / (1 + numSyncedGradients));
+                grad.copy_(syncedGrads[i]);
+                //grad.mul_(1.0f / numSyncedGradients);
+                syncedGrads[i].zero_();
+                ++i;
+              }
+            }
+            numSyncedGradients = 0;
+          }
+        }
+        ++numUpdates_;
+        log("numUpdates is now %d\n", numUpdates_);
+
+        l.unlock();
+        log("Stepping optimizer\n");
+        Profile p("python step_optimizer");
+        {
+          py::gil_scoped_acquire gil;
+          learner_.attr("step_optimizer")();
+        }
+        l.lock();
+
+        std::vector<torch::Tensor> sendParameters;
+        std::vector<torch::Tensor> sendBuffers;
+
+        for (auto& v : modelParameters) {
+          sendParameters.push_back(v.to(torch::kCPU, true, true));
+        }
+        for (auto& v : modelBuffers) {
+          sendBuffers.push_back(v.to(torch::kCPU, true, true));
+        }
+
+        for (auto& n : members_) {
+          if (n != myName) {
+            call<bool>(n, "modelUpdate", groupName_, syncId_, numUpdates_, sendParameters, sendBuffers);
+          }
+        }
+
+        zeroGrad();
+      } else {
+        numSyncedGradients = 0;
+        for (auto& v : syncedGrads) {
+          v.zero_();
+        }
+      }
+    } else {
+      log("No members, zeroing grad\n");
+      zeroGrad();
+    }
+
+    if (haveNewParameters) {
+      commitModelUpdate();
+    }
+
+    if (isCuda) {
+      trainCudaStream->synchronize();
+    }
+  }
+
+  struct AsyncTrainQueueEntry {
+    std::map<std::string, torch::Tensor> inputMap;
+    std::map<std::string, torch::Tensor> outputMap;
+    std::vector<torch::Tensor> initialState;
+    Future<void> foo;
+  };
+
+  std::list<AsyncTrainQueueEntry> asyncTrainQueue;
+
+  void asyncTrain(
+        std::map<std::string, torch::Tensor> inputMap,
+        std::map<std::string, torch::Tensor> outputMap,
+        std::vector<torch::Tensor> initialState) {
+
+    AsyncTrainQueueEntry e;
+    e.inputMap = std::move(inputMap);
+    e.outputMap = std::move(outputMap);
+    e.initialState = std::move(initialState);
+
+    if (rpc) {
+      std::unique_lock l(syncMutex);
+      if (!members_.empty()) {
+        if (syncMaster == myName) {
+
+        } else {
+          //call<void>(syncMaster, );
+        }
+      }
+    }
+
+  }
+
+  void syncUpdate() {
+    if (!rpc) {
+      return;
+    }
+    auto now = std::chrono::steady_clock::now();
+    if (hasPinged && !pingFuture && now - lastPing < std::chrono::seconds(10)) {
+      if (now - lastPing >= std::chrono::seconds(2)) {
+        log("Broker is lagging behind!");
+      }
+    } else if (now - lastPing >= std::chrono::seconds(4)) {
+      lastPing = now;
+      hasPinged = true;
+      pingFuture = call<void>("broker", "ping", groupName_, myName, numUpdates_);
+    }
+
+    std::unique_lock l(syncMutex);
+
+    if (!members_.empty()) {
+      std::string_view master = members_.front();
+      if (syncMaster != master) {
+        gradFuture.reset();
+        if (syncMaster.empty()) {
+          log("Master is %s\n", master);
+        } else {
+          log("Master changed from %s to %s\n", syncMaster, master);
+        }
+        if (master == myName) {
+          log("I am now the master!\n");
+        }
+        syncMaster = master;
+      }
+    }
+  }
+
   void trainStep(
         const std::map<std::string, torch::Tensor>& inputMap,
         const std::map<std::string, torch::Tensor>& outputMap,
-        const std::vector<torch::Tensor>& initialState,
-        bool runOptimizer) {
+        const std::vector<torch::Tensor>& initialState) {
 
     if (isCuda) {
       if (!trainCudaStream) {
@@ -1121,52 +1297,10 @@ struct TestJob {
 
     //log("Buffer %d stepped\n", bufferIndex);
 
-    auto zeroGrad = [&]() {
-      for (auto& v : modelParameters) {
-        auto& grad = v.grad();
-        if (grad.defined()) {
-          grad.detach_();
-          grad.zero_();
-        }
-      }
-    };
-
     if (rpc) {
-      auto now = std::chrono::steady_clock::now();
-      if (hasPinged && !pingFuture && now - lastPing < std::chrono::seconds(10)) {
-        log("Broker is lagging behind!");
-      } else if (now - lastPing >= std::chrono::seconds(4)) {
-        lastPing = now;
-        hasPinged = true;
-        pingFuture = call<void>("broker", "ping", groupName_, myName, numUpdates_);
-      }
-//                float sum = 0.0f;
-//                for (auto& v : modelParameters) {
-//                  auto& grad = v.grad();
-//                  if (grad.defined()) {
-//                    sum += grad.sum().item<float>();
-//                  }
-//                }
-//                log("sum of grads: %g\n", sum);
-
       std::unique_lock l(syncMutex);
-
       if (!members_.empty()) {
-        std::string_view master = members_.front();
-        if (syncMaster != master) {
-          gradFuture.reset();
-          if (syncMaster.empty()) {
-            log("Master is %s\n", master);
-          } else {
-            log("Master changed from %s to %s\n", syncMaster, master);
-          }
-          if (master == myName) {
-            log("I am now the master!\n");
-          }
-          syncMaster = master;
-        }
-
-        if (master != myName) {
+        if (syncMaster != myName) {
           if (std::find(members_.begin(), members_.end(), myName) != members_.end()) {
             std::vector<torch::Tensor> grads;
             for (auto& v : modelParameters) {
@@ -1188,7 +1322,7 @@ struct TestJob {
               //gradFuture = call<bool>(master, "grads", groupName_, syncId_, numUpdates_, grads);
               gradTimestamp = now;
               Future<bool> retval;
-              rpc->asyncCallback<bool>(master, "grads", [retval](bool* value, rpc::Error* err) mutable {
+              rpc->asyncCallback<bool>(syncMaster, "grads", [retval](bool* value, rpc::Error* err) mutable {
                 if (value) {
                   log("grads returned %d!\n", *value);
                   retval.set(*value);
@@ -1202,94 +1336,20 @@ struct TestJob {
             log("I am not a member, not participating in sync!\n");
           }
           zeroGrad();
-        }
-      }
-
-      Profile p("optimizer stuff");
-
-      if (runOptimizer) {
-
-        if (!members_.empty()) {
-          std::string_view master = members_.front();
-          if (master == myName) {
-            if (syncedGrads.empty()) {
-              for (auto& v : modelParameters) {
-                auto& grad = v.grad();
-                if (grad.defined()) {
-                  syncedGrads.push_back(torch::zeros_like(grad, torch::TensorOptions(torch::kCPU).pinned_memory(true)));
-                }
-              }
-            } else {
-              log("Adding in %d gradients\n", numSyncedGradients);
-              if (numSyncedGradients) {
-                size_t i = 0;
-                for (auto& v : modelParameters) {
-                  auto& grad = v.grad();
-                  if (grad.defined()) {
-                    if (i == syncedGrads.size()) {
-                      throw std::runtime_error("grads grew?");
-                    }
-                    grad.add_(syncedGrads[i].to(device, true));
-                    grad.mul_(1.0f / (1 + numSyncedGradients));
-                    syncedGrads[i].zero_();
-                    ++i;
-                  }
-                }
-                numSyncedGradients = 0;
-              }
-            }
-            ++numUpdates_;
-            log("numUpdates is now %d\n", numUpdates_);
-
-            l.unlock();
-            log("Stepping optimizer\n");
-            Profile p("python step_optimizer");
-            {
-              py::gil_scoped_acquire gil;
-              learner_.attr("step_optimizer")();
-            }
-            l.lock();
-
-            std::vector<torch::Tensor> sendParameters;
-            std::vector<torch::Tensor> sendBuffers;
-
-            for (auto& v : modelParameters) {
-              sendParameters.push_back(v.to(torch::kCPU, true, true));
-            }
-            for (auto& v : modelBuffers) {
-              sendBuffers.push_back(v.to(torch::kCPU, true, true));
-            }
-
-            for (auto& n : members_) {
-              if (n != myName) {
-                call<bool>(n, "modelUpdate", groupName_, syncId_, numUpdates_, sendParameters, sendBuffers);
-              }
-            }
-
-            zeroGrad();
-          }
         } else {
-          log("No members, zeroing grad\n");
+          ++numSyncedGradients;
+          if (!syncedGrads.empty()) {
+            size_t i = 0;
+            for (auto& v : modelParameters) {
+              auto& grad = v.grad();
+              syncedGrads.at(i).add_(grad.cpu());
+              ++i;
+            }
+          }
           zeroGrad();
         }
-
-        if (haveNewParameters) {
-          commitModelUpdate();
-        }
-
-        if (isCuda) {
-          trainCudaStream->synchronize();
-        }
-
-      } else {
-        Profile p("python step_optimizer");
-        {
-          py::gil_scoped_acquire gil;
-          //log("optimizer %d\n", bufferIndex);
-          learner_.attr("step_optimizer")();
-          //log("optimizer %d done \n", bufferIndex);
-        }
       }
+
     }
 
     //p.stop();
@@ -1307,7 +1367,6 @@ struct TestJob {
     int count = 0;
 
     size_t bufferCounter = 0;
-    size_t optimizeCounter = 0;
 
     local.resize(shared->buffers.size());
 
@@ -1564,6 +1623,13 @@ struct TestJob {
             trainCudaStream->synchronize();
           }
 
+          {
+            std::lock_guard l(syncMutex);
+            if (haveNewParameters) {
+              commitModelUpdate();
+            }
+          }
+
           torch::Tensor action;
           std::map<std::string, torch::Tensor> outputMap;
           {
@@ -1660,6 +1726,10 @@ struct TestJob {
               ++lbuf.currentSequenceIndex;
             }
           } else {
+            syncUpdate();
+            if (numSyncedGradients >= optimizerBatchSize) {
+              optimizerStep();
+            }
             if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
               lbuf.currentSequenceIndex = 0;
 
@@ -1779,7 +1849,7 @@ struct TestJob {
 
                   //log("train input prepared, trainQueue size is now %d\n", trainQueue.size());
 
-                  trainStep(input, outputMap, initialState, optimizeCounter++ % 2 == 0);
+                  asyncTrain(input, outputMap, initialState);
                 }
 
               } else {
@@ -1800,7 +1870,7 @@ struct TestJob {
                   ++index;
                 }
 
-                trainStep(input, outputMap, {}, bufferIndex == shared->buffers.size() - 1);
+                trainStep(input, outputMap, {});
 
                 for (auto& v : ms) {
                   v.detach_();
@@ -2027,7 +2097,7 @@ struct Broker {
   ~Broker() {
     terminate_ = true;
     //log("Note: Hackily quick-exiting\n");
-    std::quick_exit(1);
+    //std::quick_exit(1);
     runThread.join();
   }
 
