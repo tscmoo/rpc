@@ -9,6 +9,8 @@
 #include <string_view>
 #include <string>
 #include <optional>
+#include <map>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -67,6 +69,24 @@ template <typename X, typename T> void serialize(X& x, std::vector<T>& v) {
     for (size_t i = 0; i != n; ++i) {
       x(v[i]);
     }
+  }
+}
+
+template <typename X, typename Key, typename Value>
+void serialize(X& x, const std::map<Key, Value>& v) {
+  x(v.size());
+  for (auto& v2 : v) {
+    x(v2.first, v2.second);
+  }
+}
+
+template <typename X, typename Key, typename Value>
+void serialize(X& x, std::map<Key, Value>& v) {
+  v.clear();
+  size_t n = x.template read<size_t>();
+  for (; n; --n) {
+    auto k = x.template read<Key>();
+    v.emplace(std::move(k), x.template read<Value>());
   }
 }
 
@@ -418,13 +438,22 @@ void serializeToStringView(std::string_view buffer, const T&... v) {
   (x2(v), ...);
 }
 
-
 template<typename... T>
-std::string_view deserializeBuffer(const void* ptr, size_t len, T&... result) {
+std::string_view deserializeBufferPart(const void* ptr, size_t len, T&... result) {
   Deserializer des(std::string_view{(const char*)ptr, len});
   Deserialize x(des);
   x(result...);
   return des.buf;
+}
+
+template<typename... T>
+void deserializeBuffer(const void* ptr, size_t len, T&... result) {
+  Deserializer des(std::string_view{(const char*)ptr, len});
+  Deserialize x(des);
+  x(result...);
+  if (des.buf.size() != 0) {
+    throw SerializationError("deserializeBuffer: " + std::to_string(des.buf.size()) + " trailing bytes");
+  }
 }
 template<typename... T>
 auto deserializeBuffer(Buffer* buffer, T&... result) {

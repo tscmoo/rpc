@@ -499,7 +499,7 @@ struct API_TPSHM {
   static constexpr bool persistentRead = false;
   static constexpr bool persistentAccept = false;
   static constexpr bool addressIsIp = false;
-  static constexpr bool singularWrites = true;
+  static constexpr bool singularWrites = false;
 
   static std::vector<std::string> defaultAddr() {
     return {randomAddress()};
@@ -534,7 +534,7 @@ struct API_TPUV {
   static constexpr bool persistentRead = false;
   static constexpr bool persistentAccept = false;
   static constexpr bool addressIsIp = true;
-  static constexpr bool singularWrites = true;
+  static constexpr bool singularWrites = false;
 
   static std::vector<std::string> defaultAddr() {
     return {"0.0.0.0", "::"};
@@ -569,7 +569,7 @@ struct API_TPIBV {
   static constexpr bool persistentRead = false;
   static constexpr bool persistentAccept = false;
   static constexpr bool addressIsIp = true;
-  static constexpr bool singularWrites = true;
+  static constexpr bool singularWrites = false;
 
   static std::vector<std::string> defaultAddr() {
     return {"0.0.0.0", "::"};
@@ -1169,7 +1169,7 @@ struct RpcConnectionImpl : RpcConnectionImplBase {
     } else if (fid == Rpc::reqGreeting) {
       try {
         uint64_t signature;
-        deserializeBuffer(ptr, len, signature);
+        deserializeBufferPart(ptr, len, signature);
         if (signature == kSignature) {
           std::string_view peerName;
           PeerId peerId;
@@ -1298,7 +1298,11 @@ struct RpcConnectionImpl : RpcConnectionImplBase {
     } else {
       auto* ptr = buffer->data();
       size_t size = buffer->size;
-      API::cast(connection).write(ptr, size, WriteCallback(this));
+      API::cast(connection).write(ptr, size, [buffer = std::move(buffer), me = makeMe(this)](auto&& error) {
+        if (error) {
+          me->onError(std::forward<decltype(error)>(error));
+        }
+      });
     }
   }
 
@@ -1810,7 +1814,7 @@ struct Rpc::Impl {
       auto newTimeout = now + std::chrono::seconds(5);
       timeout_.store(newTimeout);
       auto process = [&](auto& container) {
-        auto absTimeoutDuration = std::chrono::seconds(60);
+        auto absTimeoutDuration = std::chrono::seconds(120);
         for (auto& b : container) {
           std::unique_lock l(b.mutex);
           bool anyToRemove = false;
@@ -1853,6 +1857,11 @@ struct Rpc::Impl {
                   log("Response %#x timed out for real\n", v.rid);
                 } else {
                   log("Request %#x timed out for real\n", v.rid);
+                }
+                if (v.resend.connection) {
+                  log("sent over %s\n", connectionTypeName.at(v.resend.connectionIndex));
+                } else {
+                  log("null connection\n");
                 }
                 i = b.map.erase(i);
               } else {
@@ -2080,8 +2089,9 @@ struct Rpc::Impl {
       throw std::runtime_error("RPC request is too large!");
     }
     auto* ptr = dataptr<std::byte>(&*buffer);
-    uint32_t rid = sequenceId.fetch_add(1, std::memory_order_relaxed) << 1 | 1;
-    if (rid % 0x100 == 0xff) {
+    uint32_t baseRid = sequenceId.fetch_add(1, std::memory_order_relaxed);
+    uint32_t rid = baseRid << 1 | 1;
+    if (baseRid % 0x100 == 0xff) {
       sequenceId.store(random<uint32_t>());
     }
     auto* ridPtr = ptr;
@@ -2121,8 +2131,9 @@ struct Rpc::Impl {
       std::unique_lock l(oBucket.mutex);
       auto in = oBucket.map.try_emplace(rid);
       while (!in.second) {
-        rid = sequenceId.fetch_add(1, std::memory_order_relaxed) << 1 | 1;
-        if (rid % 0x100 == 0xff) {
+        baseRid = sequenceId.fetch_add(1, std::memory_order_relaxed);
+        rid = baseRid << 1 | 1;
+        if (baseRid % 0x100 == 0xff) {
           sequenceId.store(random<uint32_t>());
         }
         std::memcpy(ridPtr, &rid, sizeof(rid));
@@ -2413,12 +2424,12 @@ struct Rpc::Impl {
           if (o.peer == &peer && !o.resend.connection) {
             //log("poking on newly established connection\n");
             BufferHandle buffer;
-            serializeToBuffer(buffer, o.rid, Rpc::reqPoke, o.resend.acked, (uint32_t)0);
+            serializeToBuffer(buffer, o.rid, Rpc::reqPoke, (uint32_t)0);
             conn.send(std::move(buffer));
             for (size_t i = 0; i != o.resendTensors.size(); ++i) {
               auto& t = o.resendTensors[i];
               if (!t.connection) {
-                serializeToBuffer(buffer, o.rid, Rpc::reqPoke, o.resend.acked, uint32_t(1 + i));
+                serializeToBuffer(buffer, o.rid, Rpc::reqPoke, uint32_t(1 + i));
                 conn.send(std::move(buffer));
               }
             }
@@ -2464,7 +2475,7 @@ struct Rpc::Impl {
           return false;
         }
       }
-      if (now - p->lastFindPeers <= std::chrono::seconds(5)) {
+      if (now - p->lastFindPeers <= std::chrono::seconds(2)) {
         return false;
       }
       return true;
@@ -2635,7 +2646,7 @@ struct RpcImpl : RpcImplBase {
   template<bool allowNew, typename T>
   BufferHandle handleRecv(T& container, PeerImpl& peer, RpcConnectionImpl<API>& conn, uint32_t rid,  const std::byte* ptr, size_t len) {
     uint32_t nTensors;
-    auto view = deserializeBuffer(ptr, len, nTensors);
+    auto view = deserializeBufferPart(ptr, len, nTensors);
     ptr = (const std::byte*)view.data();
     len = view.size();
     bool isTensor = nTensors == (uint32_t)~0;
@@ -2965,6 +2976,7 @@ struct RpcImpl : RpcImplBase {
       } else {
         auto recvbuffer = handleRecv<true>(rpc.incoming_, peer, conn, rid, ptr, len);
         if (recvbuffer) {
+          //log("got request rid %#x from %s\n", rid, peer.name);
           f->call(std::move(recvbuffer), [this, peer = &peer, rid](BufferHandle outbuffer) {
             auto* ptr = dataptr<std::byte>(&*outbuffer);
             std::memcpy(ptr, &rid, sizeof(rid));
@@ -3140,7 +3152,7 @@ struct RpcImpl : RpcImplBase {
             response = std::move(i->second.response);
             oBucket.map.erase(i);
           } else {
-            log("got response for unknown rid %#x from %s\n", rid, peer.name);
+            //log("got response for unknown rid %#x from %s\n", rid, peer.name);
           }
         }
         if (response) {

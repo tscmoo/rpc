@@ -57,6 +57,7 @@ void log(const char* fmt, Args&&... args) {
     if (s.size() && s.back() == '\n') {
       s.pop_back();
     }
+    s = fmt::sprintf("%d: %s", getpid(), s);
     py::gil_scoped_acquire gil;
     pyLogging.attr("info")(s);
   }
@@ -90,6 +91,9 @@ enum pyTypes : uint8_t {
   str,
   array,
   int_,
+  list,
+  none,
+  tensor,
 };
 
 template <typename X>
@@ -117,8 +121,39 @@ void serialize(X& x, const py::dict& v) {
   }
 }
 template <typename X>
+void serialize(X& x, py::dict& v) {
+  py::gil_scoped_acquire gil;
+  size_t n = x.template read<size_t>();
+  for (size_t i = 0; i != n; ++i) {
+    auto key = x.template read<py::object>();
+    v[key] = x.template read<py::object>();
+  }
+}
+template <typename X>
+void serialize(X& x, const py::list& v) {
+  x((size_t)v.size());
+  for (auto& v2 : v) {
+    x(v2);
+  }
+}
+template <typename X>
+void serialize(X& x, py::list& v) {
+  py::gil_scoped_acquire gil;
+  size_t n = x.template read<size_t>();
+  v = py::list(n);
+  for (size_t i = 0; i != n; ++i) {
+    v[i] = x.template read<py::object>();
+  }
+}
+template <typename X>
 void serialize(X& x, const py::str& v) {
   x(pyStrView(v).first);
+}
+template <typename X>
+void serialize(X& x, py::str& v) {
+  py::gil_scoped_acquire gil;
+  auto view = x.template read<std::string_view>();
+  v = py::str(view.data(), view.size());
 }
 template <typename X>
 void serialize(X& x, const py::array& v) {
@@ -143,6 +178,10 @@ void serialize(X& x, const py::array& v) {
   bytes *= v.itemsize();
   x(std::string_view((const char*)v.data(), bytes));
 }
+template <typename X>
+void serialize([[maybe_unused]] X& x, [[maybe_unused]] py::array& v) {
+  throw SerializationError("Sorry, deserializing arrays is not implemented :((");
+}
 
 template <typename X>
 void serialize(X& x, const py::handle& v) {
@@ -150,6 +189,8 @@ void serialize(X& x, const py::handle& v) {
     x(pyTypes::bool_, true);
   } else if (v.ptr() == Py_False) {
     x(pyTypes::bool_, false);
+  } else if (v.ptr() == Py_None) {
+    x(pyTypes::none);
   } else if (py::isinstance<py::float_>(v)) {
     x(pyTypes::float_, (float)py::reinterpret_borrow<py::float_>(v));
   } else if (py::isinstance<py::dict>(v)) {
@@ -160,8 +201,50 @@ void serialize(X& x, const py::handle& v) {
     x(pyTypes::array, py::reinterpret_borrow<py::array>(v));
   } else if (py::isinstance<py::int_>(v)) {
     x(pyTypes::int_, (int64_t)py::reinterpret_borrow<py::int_>(v));
+  } else if (py::isinstance<py::list>(v)) {
+    x(pyTypes::list, py::reinterpret_borrow<py::list>(v));
+  } else if (THPVariable_Check(v.ptr())) {
+    x(pyTypes::tensor, py::cast<torch::Tensor>(v));
   } else {
     throw std::runtime_error("Can't serialize python type " + std::string(py::str(v.get_type())));
+  }
+}
+
+template <typename X>
+void serialize(X& x, py::object& v) {
+  py::gil_scoped_acquire gil;
+  pyTypes type;
+  x(type);
+  switch (type) {
+  case pyTypes::bool_:
+    v = py::bool_(x.template read<bool>());
+    break;
+  case pyTypes::none:
+    v = py::none();
+    break;
+  case pyTypes::float_:
+    v = py::float_(x.template read<float>());
+    break;
+  case pyTypes::dict:
+    v = x.template read<py::dict>();
+    break;
+  case pyTypes::str:
+    v = x.template read<py::str>();
+    break;
+  case pyTypes::array:
+    v = x.template read<py::array>();
+    break;
+  case pyTypes::int_:
+    v = py::int_(x.template read<int64_t>());
+    break;
+  case pyTypes::list:
+    v = x.template read<py::list>();
+    break;
+  case pyTypes::tensor:
+    v = py::reinterpret_steal<py::object>(THPVariable_Wrap(x.template read<torch::Tensor>()));
+    break;
+  default:
+    throw std::runtime_error("Can't deserialize python type (unknown type " + std::to_string(type) + ")");
   }
 }
 
@@ -420,7 +503,7 @@ struct Shared {
   };
 
   alignas(64) std::atomic_int clients = 0;
-  std::array<Buffer, 1> buffers;
+  std::array<Buffer, 2> buffers;
 
 
   std::byte* allocateNonAligned(size_t n) {
@@ -640,7 +723,7 @@ struct Env {
         //env_.attr("render")();
         //std::this_thread::sleep_for(std::chrono::milliseconds(1000));
       } else {
-        log("step action %d\n", action);
+        //log("step action %d\n", action);
         py::tuple tup = step_(action);
         obs = tup[0];
         reward = (py::float_)tup[1];
@@ -653,8 +736,8 @@ struct Env {
         if (done) {
           log("episode done after %d steps with %g total reward\n", episodeStep, episodeReturn);
           obs = reset_();
-          std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-          env_.attr("render")();
+          //std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+          //env_.attr("render")();
           episodeStep = 0;
           episodeReturn = 0;
         }
@@ -803,6 +886,9 @@ public:
   Future() {
     s = std::make_shared<S>();
   }
+  void reset() {
+    *this = Future();
+  }
   void set() {
     s->value.emplace();
     s->hasValue = true;
@@ -840,6 +926,45 @@ Future<T> callImpl(rpc::Rpc& rpc, std::string_view peerName, std::string_view fu
   return retval;
 }
 
+template<typename T>
+struct GilWrapper {
+  std::optional<T> obj;
+  GilWrapper() = default;
+  GilWrapper(const GilWrapper& n) {
+    py::gil_scoped_acquire gil;
+    obj = n.obj;
+  }
+  GilWrapper(GilWrapper&& n) {
+    py::gil_scoped_acquire gil;
+    obj = std::move(n.obj);
+  }
+  ~GilWrapper() {
+    py::gil_scoped_acquire gil;
+    obj.reset();
+  }
+  T& operator*() {
+    return *obj;
+  }
+  GilWrapper& operator=(const GilWrapper& n) {
+    py::gil_scoped_acquire gil;
+    obj = n.obj;
+    return *this;
+  }
+  GilWrapper& operator=(GilWrapper&& n) {
+    py::gil_scoped_acquire gil;
+    obj = std::move(n.obj);
+    return *this;
+  }
+  template<typename X>
+  void serialize(X& x) {
+    py::gil_scoped_acquire gil;
+    obj.emplace();
+    x(*obj);
+  }
+  template<typename X>
+  void serialize(const X& x) = delete;
+};
+
 struct TestJob {
 
   std::thread runThread;
@@ -866,16 +991,21 @@ struct TestJob {
   std::string syncMaster;
 
   std::mutex syncMutex;
+  bool isResyncing = false;
   uint32_t syncId_ = -1;
+  uint32_t newSyncId_ = -1;
   std::vector<std::string> members_;
+  std::vector<std::string> newMembers_;
 
   bool haveNewParameters = false;
   uint32_t newNumUpdates = 0;
   std::vector<torch::Tensor> newParameters;
   std::vector<torch::Tensor> newBuffers;
+  py::object newOptimizerState;
 
   size_t numSyncedGradients = 0;
   std::vector<torch::Tensor> syncedGrads;
+  std::vector<std::tuple<uint32_t, uint32_t, std::vector<torch::Tensor>>> queuedSyncGrads;
 
   std::string myName;
   std::vector<torch::Tensor> modelParameters;
@@ -897,8 +1027,8 @@ struct TestJob {
   std::deque<LocalBuffer> local;
 
   size_t trainBatchSize = 256;
-  size_t actorBatchSize = 1;
-  size_t optimizerBatchSize = 2;
+  size_t actorBatchSize = 256;
+  //size_t optimizerBatchSize = 2;
 
   template<typename T, typename... Args>
   Future<T> call(std::string_view peerName, std::string_view funcName, Args&&... args) {
@@ -914,8 +1044,9 @@ struct TestJob {
       rpc->define<uint32_t(std::string_view, uint32_t)>("sync", [this](std::string_view group, uint32_t syncId) {
         std::lock_guard l(syncMutex);
         if (group == groupName_) {
-          syncId_ = syncId;
-          log("synced with id %#x\n", syncId);
+          isResyncing = true;
+          newSyncId_ = syncId;
+          log("got sync request for id %#x\n", syncId);
           return syncId;
         } else {
           return (uint32_t)-1;
@@ -934,8 +1065,8 @@ struct TestJob {
           }
           s += "}";
           log("group %s update members %s\n", group, s);
-          members_ = std::move(members);
-          return members_.front();
+          newMembers_ = std::move(members);
+          return newMembers_.front();
         } else {
           return std::string();
         }
@@ -943,13 +1074,14 @@ struct TestJob {
 
       rpc->define<bool(std::string_view, uint32_t, uint32_t, std::vector<torch::Tensor>)>("grads", [this](std::string_view group, uint32_t syncId, uint32_t numUpdates, std::vector<torch::Tensor> grads) {
         std::lock_guard l(syncMutex);
-        if (syncMaster != myName) {
-          log("Got grads but I am not the master!\n");
-          return false;
-        }
         if (group != groupName_) {
           log("Got grads for wrong group %s\n", group);
           return false;
+        }
+        if (!isWaitingForGradients) {
+          log("Got early grads for next sync; queueing\n");
+          queuedSyncGrads.emplace_back(syncId, numUpdates, std::move(grads));
+          return true;
         }
         if (syncId != syncId_) {
           log("Got grads for wrong syncId (%#x, should be %#x)\n", syncId, syncId_);
@@ -961,7 +1093,7 @@ struct TestJob {
         }
         uint32_t age = numUpdates_ - numUpdates;
         log("Recv grads %#x %#x (age %d)\n", syncId, numUpdates, age);
-        if (age <= 2) {
+        if (age == 0) {
           ++numSyncedGradients;
           for (size_t i = 0; i != grads.size(); ++i) {
             syncedGrads[i].add_(grads[i]);
@@ -973,16 +1105,23 @@ struct TestJob {
         }
       });
 
-      rpc->define<bool(std::string_view, uint32_t, uint32_t, std::vector<torch::Tensor>, std::vector<torch::Tensor>)>("modelUpdate", [this](std::string_view group, uint32_t syncId, uint32_t numUpdates, std::vector<torch::Tensor> parameters, std::vector<torch::Tensor> buffers) {
+      rpc->define<void(std::string)>("getModel", [this](std::string peerName) {
+        std::unique_lock l(syncMutex);
+        if (std::find(requestedModelUpdate.begin(), requestedModelUpdate.end(), peerName) == requestedModelUpdate.end()) {
+          requestedModelUpdate.push_back(peerName);
+        }
+      });
+
+      rpc->define<bool(std::string_view, uint32_t, uint32_t, std::vector<torch::Tensor>, std::vector<torch::Tensor>, GilWrapper<py::object>)>("modelUpdate", [this](std::string_view group, uint32_t syncId, uint32_t numUpdates, std::vector<torch::Tensor> parameters, std::vector<torch::Tensor> buffers, GilWrapper<py::object> optimizerState) {
         std::unique_lock l(syncMutex);
         if (group != groupName_) {
           log("Got model update for wrong group %s\n", group);
           return false;
         }
-        if (syncId != syncId_) {
-          log("Got model update for wrong syncId (%#x, should be %#x)\n", syncId, syncId_);
-          return false;
-        }
+//        if (syncId != syncId_) {
+//          log("Got model update for wrong syncId (%#x, should be %#x)\n", syncId, syncId_);
+//          return false;
+//        }
         if (parameters.size() != modelParameters.size()) {
           log("Got model update for wrong number of parameters (%d, should be %d)\n", parameters.size(), modelParameters.size());
           return false;
@@ -996,7 +1135,29 @@ struct TestJob {
         newNumUpdates = numUpdates;
         newParameters = std::move(parameters);
         newBuffers = std::move(buffers);
+        py::gil_scoped_acquire gil;
+        newOptimizerState = std::move(*optimizerState);
         return true;
+      });
+
+      rpc->define<std::vector<AsyncTrainQueueEntry>(std::string_view)>("getTrainData", [this](std::string_view groupName) {
+        std::vector<AsyncTrainQueueEntry> r;
+        if (groupName != groupName_) {
+          log("Got train data request for wrong group (%s, my group is %s)\n", groupName, groupName_);
+          return r;
+        }
+        std::lock_guard l(syncMutex);
+        if (asyncTrainQueue.size() > 8) {
+          size_t n = std::min(asyncTrainQueue.size() / 2, (size_t)8);
+          log("Got train data request, sending %d entries\n", n);
+          for (size_t i = 0; i != n; ++i) {
+            r.push_back(std::move(asyncTrainQueue.back()));
+            asyncTrainQueue.pop_back();
+          }
+        } else {
+          log("Got train data request, but I don't have enough\n");
+        }
+        return r;
       });
 
       log("My name is %s, connecting to broker at %s\n", myName, brokerAddress);
@@ -1024,6 +1185,7 @@ struct TestJob {
     //std::quick_exit(1);
     py::gil_scoped_release gil;
     runThread.join();
+    rpc.reset();
   }
 
   void start(int numClients, py::object model, std::string deviceStr, py::object learner) {
@@ -1054,6 +1216,9 @@ struct TestJob {
     for (size_t i = 0; i != modelBuffers.size(); ++i) {
       modelBuffers[i].copy_(newBuffers[i], true);
     }
+
+    py::gil_scoped_acquire gil;
+    learner_.attr("load_optimizer_state")(newOptimizerState);
   }
 
   struct EnvState {
@@ -1100,77 +1265,54 @@ struct TestJob {
 
     if (!members_.empty()) {
       std::string_view master = members_.front();
-      if (master == myName) {
-        if (syncedGrads.empty()) {
+      if (syncedGrads.empty()) {
+        log("syncedGrads is empty!\n");
+        zeroGrad();
+      } else {
+        log("Adding in %d gradients\n", numSyncedGradients);
+        if (numSyncedGradients) {
+          size_t i = 0;
           for (auto& v : modelParameters) {
             auto& grad = v.grad();
             if (grad.defined()) {
-              syncedGrads.push_back(torch::zeros_like(grad, torch::TensorOptions(torch::kCPU).pinned_memory(true)));
-            }
-          }
-        } else {
-          log("Adding in %d gradients\n", numSyncedGradients);
-          if (numSyncedGradients) {
-            size_t i = 0;
-            for (auto& v : modelParameters) {
-              auto& grad = v.grad();
-              if (grad.defined()) {
-                if (i == syncedGrads.size()) {
-                  throw std::runtime_error("grads grew?");
-                }
+              if (i == syncedGrads.size()) {
+                throw std::runtime_error("grads grew?");
+              }
 //                grad.add_(syncedGrads[i].to(device, true));
 //                grad.mul_(1.0f / (1 + numSyncedGradients));
-                grad.copy_(syncedGrads[i]);
-                //grad.mul_(1.0f / numSyncedGradients);
-                syncedGrads[i].zero_();
-                ++i;
-              }
+              grad.copy_(syncedGrads[i]);
+              grad.mul_(1.0f / numSyncedGradients);
+              syncedGrads[i].zero_();
+              ++i;
             }
-            numSyncedGradients = 0;
           }
-        }
-        ++numUpdates_;
-        log("numUpdates is now %d\n", numUpdates_);
-
-        l.unlock();
-        log("Stepping optimizer\n");
-        Profile p("python step_optimizer");
-        {
-          py::gil_scoped_acquire gil;
-          learner_.attr("step_optimizer")();
-        }
-        l.lock();
-
-        std::vector<torch::Tensor> sendParameters;
-        std::vector<torch::Tensor> sendBuffers;
-
-        for (auto& v : modelParameters) {
-          sendParameters.push_back(v.to(torch::kCPU, true, true));
-        }
-        for (auto& v : modelBuffers) {
-          sendBuffers.push_back(v.to(torch::kCPU, true, true));
-        }
-
-        for (auto& n : members_) {
-          if (n != myName) {
-            call<bool>(n, "modelUpdate", groupName_, syncId_, numUpdates_, sendParameters, sendBuffers);
+          if (i != syncedGrads.size()) {
+            throw std::runtime_error("grads shrank?");
           }
-        }
-
-        zeroGrad();
-      } else {
-        numSyncedGradients = 0;
-        for (auto& v : syncedGrads) {
-          v.zero_();
+          numSyncedGradients = 0;
         }
       }
+      ++numUpdates_;
+      log("numUpdates is now %d\n", numUpdates_);
+
+      l.unlock();
+      log("Stepping optimizer\n");
+      Profile p("python step_optimizer");
+      {
+        py::gil_scoped_acquire gil;
+        learner_.attr("step_optimizer")();
+      }
+      float sum = 0.0f;
+      for (auto& v : modelParameters) {
+        sum += v.sum().item<float>();
+      }
+      log("parameters sum: %g\n", sum);
+      l.lock();
+
+      zeroGrad();
     } else {
       log("No members, zeroing grad\n");
       zeroGrad();
-    }
-
-    if (haveNewParameters) {
-      commitModelUpdate();
     }
 
     if (isCuda) {
@@ -1182,10 +1324,25 @@ struct TestJob {
     std::map<std::string, torch::Tensor> inputMap;
     std::map<std::string, torch::Tensor> outputMap;
     std::vector<torch::Tensor> initialState;
-    Future<void> foo;
+
+    template<typename X>
+    void serialize(X& x) {
+      x(inputMap, outputMap, initialState);
+    }
   };
 
   std::list<AsyncTrainQueueEntry> asyncTrainQueue;
+
+  bool isWaitingForGradients = false;
+  size_t waitingForGradientsSize = 0;
+  std::chrono::steady_clock::time_point waitingForGradientsTimestamp;
+
+  bool isWaitingForModel = false;
+  std::chrono::steady_clock::time_point isWaitingForModelTimestamp;
+
+  Future<std::vector<AsyncTrainQueueEntry>> getTrainDataFuture;
+  bool isWaitingForTrainData = false;
+  std::chrono::steady_clock::time_point getTrainDataTimestamp;
 
   void asyncTrain(
         std::map<std::string, torch::Tensor> inputMap,
@@ -1199,15 +1356,45 @@ struct TestJob {
 
     if (rpc) {
       std::unique_lock l(syncMutex);
-      if (!members_.empty()) {
-        if (syncMaster == myName) {
-
-        } else {
-          //call<void>(syncMaster, );
+      if (isWaitingForGradients || isWaitingForModel) {
+        log("Waiting for gradients, push to queue\n");
+        asyncTrainQueue.push_back(e);
+        if (asyncTrainQueue.size() == 65) {
+          log("WARNING: async train queue is full, discarding data!\n");
+          asyncTrainQueue.pop_front();
         }
+      } else {
+        l.unlock();
+        log("Not waiting for gradients, do trainStep!\n");
+        trainStep(e.inputMap, e.outputMap, e.initialState);
       }
     }
 
+  }
+
+  std::vector<std::string> requestedModelUpdate;
+
+  void sendModelUpdates() {
+    std::vector<torch::Tensor> sendParameters;
+    std::vector<torch::Tensor> sendBuffers;
+
+    for (auto& v : modelParameters) {
+      sendParameters.push_back(v.to(torch::kCPU, true, true));
+    }
+    for (auto& v : modelBuffers) {
+      sendBuffers.push_back(v.to(torch::kCPU, true, true));
+    }
+
+    py::gil_scoped_acquire gil;
+    py::object optimizerState = learner_.attr("optimizer_state")();
+
+    for (auto& n : requestedModelUpdate) {
+      if (n != myName && std::find(members_.begin(), members_.end(), n) != members_.end()) {
+        call<bool>(n, "modelUpdate", groupName_, syncId_, numUpdates_, sendParameters, sendBuffers, optimizerState);
+      }
+    }
+
+    requestedModelUpdate.clear();
   }
 
   void syncUpdate() {
@@ -1227,27 +1414,131 @@ struct TestJob {
 
     std::unique_lock l(syncMutex);
 
-    if (!members_.empty()) {
-      std::string_view master = members_.front();
-      if (syncMaster != master) {
-        gradFuture.reset();
-        if (syncMaster.empty()) {
-          log("Master is %s\n", master);
+    static std::chrono::steady_clock::time_point lastlog = std::chrono::steady_clock::now();
+
+    bool logit = now - lastlog >= std::chrono::seconds(5);
+    if (logit) {
+      lastlog = now;
+      log("DEBUG syncUpdate()\n");
+    }
+
+    if (isResyncing) {
+      if (logit) log("DEBUG resyncing\n");
+      if (!newMembers_.empty()) {
+        syncId_ = newSyncId_;
+        members_ = std::move(newMembers_);
+        newMembers_.clear();
+        isResyncing = false;
+        isWaitingForGradients = false;
+        isWaitingForModel = false;
+        log("Sync %#x success with %d members\n", syncId_, members_.size());
+
+        if (!members_.empty()) {
+          std::string_view master = members_.front();
+          gradFuture.reset();
+          if (syncMaster.empty()) {
+            log("Master is %s\n", master);
+          } else {
+            log("Master changed from %s to %s\n", syncMaster, master);
+          }
+          syncMaster = master;
+          if (master == myName) {
+            log("I am now the master!\n");
+          } else {
+            isWaitingForModel = true;
+            isWaitingForModelTimestamp = std::chrono::steady_clock::now();
+            call<void>(syncMaster, "getModel", myName);
+          }
         } else {
-          log("Master changed from %s to %s\n", syncMaster, master);
+          syncMaster.clear();
         }
-        if (master == myName) {
-          log("I am now the master!\n");
-        }
-        syncMaster = master;
       }
+    }
+
+    if (haveNewParameters) {
+      log("DEBUG new params\n");
+      commitModelUpdate();
+      isWaitingForModel = false;
+    } else if (isWaitingForModel && now - isWaitingForModelTimestamp >= std::chrono::seconds(10)) {
+      log("Timed out waiting for model, retrying\n");
+      if (!members_.empty()) {
+        isWaitingForModel = true;
+        isWaitingForModelTimestamp = std::chrono::steady_clock::now();
+        call<void>(syncMaster, "getModel", myName);
+      }
+    }
+
+    if (!members_.empty()) {
+      sendModelUpdates();
+      if (isWaitingForGradients && !isWaitingForModel) {
+        if (numSyncedGradients >= waitingForGradientsSize) {
+          log("Got all gradients in %gs, running optimizer\n", seconds(std::chrono::steady_clock::now() - waitingForGradientsTimestamp));
+          l.unlock();
+          optimizerStep();
+          l.lock();
+          isWaitingForGradients = false;
+        } else {
+          auto now = std::chrono::steady_clock::now();
+          if (now - waitingForGradientsTimestamp >= std::chrono::seconds(30)) {
+            log("Timed out waiting for gradients! Requesting resync\n");
+            call<void>("broker", "resync", groupName_);
+            if (syncMaster != myName) {
+              isWaitingForModel = true;
+              isWaitingForModelTimestamp = std::chrono::steady_clock::now();
+              call<void>(syncMaster, "getModel", myName);
+            }
+            isWaitingForGradients = false;
+          }
+        }
+      }
+    }
+
+    if (logit) {
+      log("DEBUG isWaitingForGradients: %d\n", isWaitingForGradients);
+      log("DEBUG isWaitingForModel: %d\n", isWaitingForModel);
+      log("DEBUG asyncTrainQueue: %d\n", asyncTrainQueue.size());
+    }
+
+    if (getTrainDataFuture) {
+      log("Got %d entries of train data\n", getTrainDataFuture->size());
+      for (auto& v : *getTrainDataFuture) {
+        asyncTrainQueue.push_back(std::move(v));
+      }
+      getTrainDataFuture.reset();
+      isWaitingForTrainData = false;
+    }
+
+    if (isWaitingForTrainData) {
+      if (now - getTrainDataTimestamp >= std::chrono::seconds(10)) {
+        log("Timed out waiting for train data\n");
+        isWaitingForTrainData = false;
+      }
+    } else if (asyncTrainQueue.empty() && now - getTrainDataTimestamp >= std::chrono::seconds(2)) {
+      if (!members_.empty()) {
+        size_t n = std::uniform_int_distribution<size_t>(0, members_.size() - 1)(threadRng);
+        auto peer = members_[n];
+        if (peer != myName) {
+          log("Train queue is empty, requesting train data from %s\n", peer);
+          isWaitingForTrainData = true;
+          getTrainDataTimestamp = now;
+          getTrainDataFuture = call<std::vector<AsyncTrainQueueEntry>>(peer, "getTrainData", groupName_);
+        }
+      }
+    }
+
+    if (!isWaitingForGradients && !isWaitingForModel && !asyncTrainQueue.empty()) {
+      auto e = std::move(asyncTrainQueue.back());
+      asyncTrainQueue.pop_back();
+      log("DEBUG asyncTrainQueue now has %d entries\n", asyncTrainQueue.size());
+      l.unlock();
+      trainStep(e.inputMap, e.outputMap, e.initialState);
     }
   }
 
   void trainStep(
-        const std::map<std::string, torch::Tensor>& inputMap,
-        const std::map<std::string, torch::Tensor>& outputMap,
-        const std::vector<torch::Tensor>& initialState) {
+        std::map<std::string, torch::Tensor>& inputMap,
+        std::map<std::string, torch::Tensor>& outputMap,
+        std::vector<torch::Tensor>& initialState) {
 
     if (isCuda) {
       if (!trainCudaStream) {
@@ -1262,14 +1553,21 @@ struct TestJob {
         l.cudaStream->synchronize();
       }
     }
-
-    {
-      std::lock_guard l(syncMutex);
-      if (haveNewParameters) {
-        commitModelUpdate();
+    for (auto& [key, value] : inputMap) {
+      if (value.device() != device) {
+        value = value.to(device);
       }
     }
-
+    for (auto& [key, value] : outputMap) {
+      if (value.device() != device) {
+        value = value.to(device);
+      }
+    }
+    for (auto& value : initialState) {
+      if (value.device() != device) {
+        value = value.to(device);
+      }
+    }
     //auto msStack = torch::stack(ms);
     if (false) {
       log("step wee\n");
@@ -1291,6 +1589,19 @@ struct TestJob {
         learner_.attr("step")(inputMap, outputMap, initialState);
       }
       //log("step %d done\n", bufferIndex);
+
+      if (syncedGrads.empty()) {
+        for (auto& v : modelParameters) {
+          auto& grad = v.grad();
+          if (grad.defined()) {
+            if (isCuda) {
+              syncedGrads.push_back(torch::zeros_like(grad, torch::TensorOptions(torch::kCPU).pinned_memory(true)));
+            } else {
+              syncedGrads.push_back(torch::zeros_like(grad, torch::TensorOptions(torch::kCPU)));
+            }
+          }
+        }
+      }
     }
 
     torch::GradMode::set_enabled(false);
@@ -1300,43 +1611,45 @@ struct TestJob {
     if (rpc) {
       std::unique_lock l(syncMutex);
       if (!members_.empty()) {
-        if (syncMaster != myName) {
-          if (std::find(members_.begin(), members_.end(), myName) != members_.end()) {
-            std::vector<torch::Tensor> grads;
-            for (auto& v : modelParameters) {
-              auto& grad = v.grad();
-              if (grad.defined()) {
-                grads.push_back(grad.to(torch::kCPU, false, true));
-              }
+        if (std::find(members_.begin(), members_.end(), myName) != members_.end()) {
+          isWaitingForGradients = true;
+          waitingForGradientsSize = members_.size();
+          waitingForGradientsTimestamp = std::chrono::steady_clock::now();
+          std::vector<torch::Tensor> grads;
+          if (numSyncedGradients) {
+            numSyncedGradients = 0;
+            for (auto& v : syncedGrads) {
+              v.zero_();
             }
-            log("Master %s, sync id {%#x, %#x}. Sending gradients\n", syncMaster, syncId_, numUpdates_);
-            auto now = std::chrono::steady_clock::now();
-            if (gradFuture && !*gradFuture && now - gradTimestamp < std::chrono::seconds(30)) {
-              log("Warning: master is lagging behind for grad sync, skipping this one\n");
-              ++masterLagCount;
-              if (masterLagCount == 4) {
-                log("Requesting resync\n");
-                call<void>("broker", "resync", groupName_);
-              }
-            } else {
-              //gradFuture = call<bool>(master, "grads", groupName_, syncId_, numUpdates_, grads);
-              gradTimestamp = now;
-              Future<bool> retval;
-              rpc->asyncCallback<bool>(syncMaster, "grads", [retval](bool* value, rpc::Error* err) mutable {
+          }
+          for (auto& v : modelParameters) {
+            auto& grad = v.grad();
+            if (grad.defined()) {
+              grads.push_back(grad.to(torch::kCPU, false, true));
+            }
+          }
+          log("Master %s, sync id {%#x, %#x}. Sending gradients\n", syncMaster, syncId_, numUpdates_);
+          for (auto& n : members_) {
+            if (n != myName) {
+              rpc->asyncCallback<bool>(n, "grads", [this, syncid = syncId_](bool* value, rpc::Error* err) mutable {
                 if (value) {
                   log("grads returned %d!\n", *value);
-                  retval.set(*value);
+                  std::unique_lock l(syncMutex);
+                  if (!*value && syncid == syncId_ && !isResyncing) {
+                    log("grads failed, requesting resync\n");
+                    call<void>("broker", "resync", groupName_);
+                    if (syncMaster != myName) {
+                      isWaitingForModel = true;
+                      isWaitingForModelTimestamp = std::chrono::steady_clock::now();
+                      call<void>(syncMaster, "getModel", myName);
+                    }
+                  }
                 } else {
                   log("RPC error: %s\n", err->what());
                 }
               }, groupName_, syncId_, numUpdates_, grads);
-              gradFuture = std::move(retval);
             }
-          } else {
-            log("I am not a member, not participating in sync!\n");
           }
-          zeroGrad();
-        } else {
           ++numSyncedGradients;
           if (!syncedGrads.empty()) {
             size_t i = 0;
@@ -1346,11 +1659,43 @@ struct TestJob {
               ++i;
             }
           }
-          zeroGrad();
+          bool resync = false;
+          for (auto& v : queuedSyncGrads) {
+            auto& [sid, numupdates, grads] = v;
+            if (sid != syncId_ || numupdates != numUpdates_) {
+              log("Got queued update for {%d, %d}, expected {%d, %d}\n", sid, numupdates, syncId_, numUpdates_);
+              //log("Got queued update for {%d, %d}, expected {%d, %d}. Requesting resync\n", sid, numupdates, syncId_, numUpdates_);
+              //resync = true;
+            } else if (grads.size() != syncedGrads.size()) {
+              log("Got queued grads for wrong number of grads\n");
+              //log("Got queued grads for wrong number of grads. Requesting resync\n");
+              //resync = true;
+            } else {
+              ++numSyncedGradients;
+              size_t i = 0;
+              for (auto& v : grads) {
+                syncedGrads[i].add_(v);
+                ++i;
+              }
+            }
+          }
+          queuedSyncGrads.clear();
+          if (resync) {
+            call<void>("broker", "resync", groupName_);
+            if (syncMaster != myName) {
+              isWaitingForModel = true;
+              isWaitingForModelTimestamp = std::chrono::steady_clock::now();
+              call<void>(syncMaster, "getModel", myName);
+            }
+          }
+        } else {
+          log("I am not a member, not participating in sync!\n");
         }
       }
 
     }
+
+    zeroGrad();
 
     //p.stop();
   }
@@ -1623,13 +1968,6 @@ struct TestJob {
             trainCudaStream->synchronize();
           }
 
-          {
-            std::lock_guard l(syncMutex);
-            if (haveNewParameters) {
-              commitModelUpdate();
-            }
-          }
-
           torch::Tensor action;
           std::map<std::string, torch::Tensor> outputMap;
           {
@@ -1727,9 +2065,6 @@ struct TestJob {
             }
           } else {
             syncUpdate();
-            if (numSyncedGradients >= optimizerBatchSize) {
-              optimizerStep();
-            }
             if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
               lbuf.currentSequenceIndex = 0;
 
@@ -1753,7 +2088,7 @@ struct TestJob {
 
                 log("trainQueue size grew to %d\n", trainQueue.size());
 
-                while (!trainQueue.empty()) {
+                while (!trainQueue.empty() && !isResyncing) {
 
                   size_t n = 0;
                   size_t inputSize = 0;
@@ -1853,6 +2188,9 @@ struct TestJob {
                 }
 
               } else {
+                printf("unreachable\n");
+
+                std::abort();
 
                 //std::lock_guard lm(modelMutex);
                 //log("Stepping buffer %d\n", bufferIndex);
@@ -1870,7 +2208,7 @@ struct TestJob {
                   ++index;
                 }
 
-                trainStep(input, outputMap, {});
+                //trainStep(input, outputMap, {});
 
                 for (auto& v : ms) {
                   v.detach_();
@@ -1950,6 +2288,7 @@ struct TestClient {
   std::thread runThread;
 
   std::array<EnvBatch, 10> batch;
+  bool running_ = false;
 
   TestClient(py::object envInit) {
     for (auto& b : batch) {
@@ -1969,12 +2308,21 @@ struct TestClient {
   }
 
   bool running() {
-    return runThread.joinable();
+    return running_;
   }
+
+  struct SetNotRunning {
+    TestClient* me;
+    ~SetNotRunning() {
+      me->running_ = false;
+    }
+  };
 
   void start(std::string serverAddress) {
     serverAddress_ = serverAddress;
+    running_ = true;
     runThread = std::thread([this]() {
+      SetNotRunning t{this};
       run();
     });
   }
@@ -2180,7 +2528,7 @@ struct Broker {
               }
             }
           }
-          log("Sync midway %s %d/%d in %gs\n", g.name, ready, total, seconds(now - g.lastUpdate));
+          //log("Sync midway %s %d/%d in %gs\n", g.name, ready, total, seconds(now - g.lastUpdate));
           if (ready >= total || now - g.lastUpdate >= std::chrono::seconds(1)) {
             log("Sync %s %d/%d in %gs\n", g.name, ready, total, seconds(now - g.lastUpdate));
 
