@@ -1,0 +1,9 @@
+[submodule "src/fmt"]
+	path = src/fmt
+	url = https://github.com/fmtlib/fmt
+[submodule "src/pybind11"]
+	path = src/pybind11
+	url = https://github.com/pybind/pybind11
+[submodule "src/tensorpipe"]
+	path = src/tensorpipe
+	url = https://github.com/tscmoo/tensorpipe
