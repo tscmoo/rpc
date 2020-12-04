@@ -1079,7 +1079,7 @@ struct TestJob {
           return false;
         }
         if (!isWaitingForGradients) {
-          log("Got early grads for next sync; queueing\n");
+          log("Got early grads; queueing\n");
           queuedSyncGrads.emplace_back(syncId, numUpdates, std::move(grads));
           return true;
         }

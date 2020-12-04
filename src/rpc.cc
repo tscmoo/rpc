@@ -1,6 +1,5 @@
 #include "rpc.h"
 
-#include "network.h"
 #include "shm2.h"
 
 #include <tensorpipe/tensorpipe.h>
@@ -366,82 +365,6 @@ Connection::Connection(std::shared_ptr<Pipe> inpipe, std::shared_ptr<Pipe> outpi
 
 }
 
-namespace network {
-
-struct Connection;
-struct Listener;
-
-struct Context {
-  Connection connect(std::string_view addr);
-  Listener listen(std::string_view addr);
-
-  ::network::Network nw;
-
-  std::thread thread, thread2, thread3;
-  Context() {
-    thread = std::thread([this]() {
-      while (true) {
-        nw.run_one();
-      }
-    });
-//    thread2 = std::thread([this]() {
-//      while (true) {
-//        nw.run_one();
-//      }
-//    });
-//    thread3 = std::thread([this]() {
-//      while (true) {
-//        nw.run_one();
-//      }
-//    });
-  }
-};
-
-struct Listener {
-  ::network::Server server;
-
-  void accept(Function<void(Error*, Connection&&)>&& callback);
-};
-
-
-struct Connection {
-  ::network::Peer peer;
-
-  void close() {
-    peer.post_close();
-  }
-  void read(Function<bool(Error*, const void*, size_t)>&& callback) {
-    peer.setOnMessage([callback = std::move(callback)](const void* ptr, size_t len) {
-      callback(nullptr, ptr, len);
-    });
-  }
-  void write(const void* ptr, size_t len, Function<void(Error*)>&& callback) {
-    peer.sendMessage(ptr, len);
-    callback(nullptr);
-  }
-};
-
-void Listener::accept(Function<void (Error*, Connection&&)>&& callback) {
-  server.setOnPeer([callback = std::move(callback)](auto&& peer) {
-    Connection conn;
-    conn.peer = std::move(peer);
-    callback(nullptr, std::move(conn));
-  });
-}
-
-Connection Context::connect(std::string_view addr) {
-  Connection c;
-  c.peer = nw.connect(addr);
-  return c;
-}
-Listener Context::listen(std::string_view addr) {
-  Listener l;
-  l.server = nw.listen(addr);
-  return l;
-}
-
-}
-
 std::string randomAddress() {
   std::string s;
   for (int i = 0; i != 2; ++i) {
@@ -592,20 +515,6 @@ struct API_TPIBV {
   }
   static std::string errstr(const rpc_tensorpipe::Error& err) {
     return err.what();
-  }
-};
-
-struct API_Network {
-  using Context = network::Context;
-  using Connection = network::Connection;
-  using Listener = network::Listener;
-
-  static constexpr bool supportsBuffer = false;
-  static constexpr bool persistentRead = true;
-  static constexpr bool persistentAccept = true;
-
-  template<typename T> static T& cast(T& v) {
-    return v;
   }
 };
 
@@ -3207,16 +3116,7 @@ void PeerImpl::connect(std::string_view addr) {
   rpc.connect<API, explicit_>(addr);
 }
 
-//void RpcListener::accept(Function<void(RpcConnection*, Error*)>&& callback) {
-//  impl_->accept(std::move(callback));
-//}
-
 Rpc::Rpc() {
-  //impl_ = std::make_unique<RpcImpl<APIWrapper<API_Network>>>();
-  //impl_ = std::make_unique<RpcImpl<APIWrapper<API_TPUV>>>();
-  //impl_ = std::make_unique<RpcImpl<APIWrapper<API_TPSHM>>>();
-  //impl_ = std::make_unique<RpcImpl<APIWrapper<API_InProcess>>>();
-
   impl_ = std::make_unique<Rpc::Impl>();
 }
 Rpc::~Rpc() {}
