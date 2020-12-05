@@ -94,6 +94,7 @@ enum pyTypes : uint8_t {
   list,
   none,
   tensor,
+  tuple,
 };
 
 template <typename X>
@@ -205,6 +206,8 @@ void serialize(X& x, const py::handle& v) {
     x(pyTypes::list, py::reinterpret_borrow<py::list>(v));
   } else if (THPVariable_Check(v.ptr())) {
     x(pyTypes::tensor, py::cast<torch::Tensor>(v));
+  } else if (py::isinstance<py::tuple>(v)) {
+    x(pyTypes::tuple, py::reinterpret_borrow<py::tuple>(v));
   } else {
     throw std::runtime_error("Can't serialize python type " + std::string(py::str(v.get_type())));
   }
@@ -243,6 +246,9 @@ void serialize(X& x, py::object& v) {
   case pyTypes::tensor:
     v = py::reinterpret_steal<py::object>(THPVariable_Wrap(x.template read<torch::Tensor>()));
     break;
+  case pyTypes::tuple:
+    v = x.template read<py::tuple>();
+    break;
   default:
     throw std::runtime_error("Can't deserialize python type (unknown type " + std::to_string(type) + ")");
   }
@@ -254,6 +260,15 @@ void serialize(X& x, const py::tuple& v) {
   x(n);
   for (auto& v2 : v) {
     x(v2);
+  }
+}
+template <typename X>
+void serialize(X& x, py::tuple& v) {
+  py::gil_scoped_acquire gil;
+  size_t n = x.template read<size_t>();
+  v = py::tuple(n);
+  for (size_t i = 0; i != n; ++i) {
+    v[i] = x.template read<py::object>();
   }
 }
 
@@ -503,7 +518,7 @@ struct Shared {
   };
 
   alignas(64) std::atomic_int clients = 0;
-  std::array<Buffer, 2> buffers;
+  std::array<Buffer, 1> buffers;
 
 
   std::byte* allocateNonAligned(size_t n) {
@@ -847,6 +862,8 @@ struct LocalBuffer {
   std::vector<torch::Tensor> outputDeviceSeq;
   std::vector<torch::Tensor> initialModelState;
 
+  std::vector<torch::Tensor> nextInitialModelState;
+
   size_t currentSequenceIndex = 0;
 
   alignas(64) std::atomic_int stepCount = 0;
@@ -998,6 +1015,7 @@ struct TestJob {
   std::vector<std::string> newMembers_;
 
   bool haveNewParameters = false;
+  bool haveNewBuffers = false;
   uint32_t newNumUpdates = 0;
   std::vector<torch::Tensor> newParameters;
   std::vector<torch::Tensor> newBuffers;
@@ -1027,7 +1045,7 @@ struct TestJob {
   std::deque<LocalBuffer> local;
 
   size_t trainBatchSize = 256;
-  size_t actorBatchSize = 256;
+  size_t actorBatchSize = 1;
   //size_t optimizerBatchSize = 2;
 
   template<typename T, typename... Args>
@@ -1078,7 +1096,7 @@ struct TestJob {
           log("Got grads for wrong group %s\n", group);
           return false;
         }
-        if (!isWaitingForGradients) {
+        if (!isWaitingForGradients || numUpdates > numUpdates_) {
           log("Got early grads; queueing\n");
           queuedSyncGrads.emplace_back(syncId, numUpdates, std::move(grads));
           return true;
@@ -1140,6 +1158,17 @@ struct TestJob {
         return true;
       });
 
+      rpc->define<bool(std::string_view,  std::vector<torch::Tensor>)>("buffersUpdate", [this](std::string_view group, std::vector<torch::Tensor> buffers) {
+        std::unique_lock l(syncMutex);
+        if (group != groupName_) {
+          return false;
+        }
+        log("Got buffers\n");
+        haveNewBuffers = true;
+        newBuffers = std::move(buffers);
+        return true;
+      });
+
       rpc->define<std::vector<AsyncTrainQueueEntry>(std::string_view)>("getTrainData", [this](std::string_view groupName) {
         std::vector<AsyncTrainQueueEntry> r;
         if (groupName != groupName_) {
@@ -1198,9 +1227,23 @@ struct TestJob {
     });
   }
 
+  void commitBuffersUpdate() {
+    log("Got new buffers, yey\n");
+    haveNewBuffers = false;
+
+    if (modelBuffers.size() != newBuffers.size()) {
+      throw std::runtime_error("Model parameters size mismatch in update!");
+    }
+
+    for (size_t i = 0; i != modelBuffers.size(); ++i) {
+      modelBuffers[i].copy_(newBuffers[i], true);
+    }
+  }
+
   void commitModelUpdate() {
     log("Got new parameters, numUpdates %d -> %d\n", numUpdates_, newNumUpdates);
     haveNewParameters = false;
+    haveNewBuffers = false;
     numUpdates_ = newNumUpdates;
 
     if (modelParameters.size() != newParameters.size()) {
@@ -1252,8 +1295,7 @@ struct TestJob {
     }
   }
 
-  void optimizerStep() {
-    torch::AutoGradMode ng(false);
+  void setTrainStream() {
     if (isCuda) {
       if (!trainCudaStream) {
         trainCudaStream = c10::cuda::getStreamFromPool(false, device.index());
@@ -1261,10 +1303,16 @@ struct TestJob {
       c10::cuda::set_device(device.index());
       c10::cuda::setCurrentCUDAStream(*trainCudaStream);
     }
+  }
+
+  void optimizerStep() {
+    //log(" NOT DOING OPTIMIZERSTEP\n");
+    //return;
+    torch::AutoGradMode ng(false);
+    setTrainStream();
     std::unique_lock l(syncMutex);
 
     if (!members_.empty()) {
-      std::string_view master = members_.front();
       if (syncedGrads.empty()) {
         log("syncedGrads is empty!\n");
         zeroGrad();
@@ -1278,8 +1326,6 @@ struct TestJob {
               if (i == syncedGrads.size()) {
                 throw std::runtime_error("grads grew?");
               }
-//                grad.add_(syncedGrads[i].to(device, true));
-//                grad.mul_(1.0f / (1 + numSyncedGradients));
               grad.copy_(syncedGrads[i]);
               grad.mul_(1.0f / numSyncedGradients);
               syncedGrads[i].zero_();
@@ -1302,11 +1348,11 @@ struct TestJob {
         py::gil_scoped_acquire gil;
         learner_.attr("step_optimizer")();
       }
-      float sum = 0.0f;
-      for (auto& v : modelParameters) {
-        sum += v.sum().item<float>();
-      }
-      log("parameters sum: %g\n", sum);
+//      float sum = 0.0f;
+//      for (auto& v : modelParameters) {
+//        sum += v.sum().item<float>();
+//      }
+//      log("parameters sum: %g\n", sum);
       l.lock();
 
       zeroGrad();
@@ -1344,10 +1390,25 @@ struct TestJob {
   bool isWaitingForTrainData = false;
   std::chrono::steady_clock::time_point getTrainDataTimestamp;
 
+  std::optional<std::chrono::steady_clock::duration> warmupTime = std::chrono::seconds(120);
+  std::optional<std::chrono::steady_clock::time_point> warmupStartTimestamp;
+
   void asyncTrain(
         std::map<std::string, torch::Tensor> inputMap,
         std::map<std::string, torch::Tensor> outputMap,
         std::vector<torch::Tensor> initialState) {
+
+    if (warmupTime) {
+      auto now = std::chrono::steady_clock::now();
+      if (!warmupStartTimestamp) {
+        warmupStartTimestamp = now;
+      }
+      if (now - *warmupStartTimestamp < warmupTime) {
+        log("Waiting for an additional %gs for environments to warm up\n", seconds(*warmupTime - (now - *warmupStartTimestamp)));
+        return;
+      }
+      warmupTime.reset();
+    }
 
     AsyncTrainQueueEntry e;
     e.inputMap = std::move(inputMap);
@@ -1359,7 +1420,7 @@ struct TestJob {
       if (isWaitingForGradients || isWaitingForModel) {
         log("Waiting for gradients, push to queue\n");
         asyncTrainQueue.push_back(e);
-        if (asyncTrainQueue.size() == 65) {
+        if (asyncTrainQueue.size() == std::max(8192 / trainBatchSize, (size_t)8)) {
           log("WARNING: async train queue is full, discarding data!\n");
           asyncTrainQueue.pop_front();
         }
@@ -1374,27 +1435,48 @@ struct TestJob {
 
   std::vector<std::string> requestedModelUpdate;
 
+  std::chrono::steady_clock::time_point lastSentBuffers;
+
   void sendModelUpdates() {
-    std::vector<torch::Tensor> sendParameters;
-    std::vector<torch::Tensor> sendBuffers;
+    if (!requestedModelUpdate.empty()) {
+      std::vector<torch::Tensor> sendParameters;
+      std::vector<torch::Tensor> sendBuffers;
 
-    for (auto& v : modelParameters) {
-      sendParameters.push_back(v.to(torch::kCPU, true, true));
+      for (auto& v : modelParameters) {
+        sendParameters.push_back(v.to(torch::kCPU, true, true));
+      }
+      for (auto& v : modelBuffers) {
+        sendBuffers.push_back(v.to(torch::kCPU, true, true));
+      }
+
+      {
+        py::gil_scoped_acquire gil;
+        py::object optimizerState = learner_.attr("optimizer_state")();
+
+        for (auto& n : requestedModelUpdate) {
+          if (n != myName && std::find(members_.begin(), members_.end(), n) != members_.end()) {
+            call<bool>(n, "modelUpdate", groupName_, syncId_, numUpdates_, sendParameters, sendBuffers, optimizerState);
+          }
+        }
+      }
+
+      requestedModelUpdate.clear();
     }
-    for (auto& v : modelBuffers) {
-      sendBuffers.push_back(v.to(torch::kCPU, true, true));
-    }
-
-    py::gil_scoped_acquire gil;
-    py::object optimizerState = learner_.attr("optimizer_state")();
-
-    for (auto& n : requestedModelUpdate) {
-      if (n != myName && std::find(members_.begin(), members_.end(), n) != members_.end()) {
-        call<bool>(n, "modelUpdate", groupName_, syncId_, numUpdates_, sendParameters, sendBuffers, optimizerState);
+    if (syncMaster == myName) {
+      auto now = std::chrono::steady_clock::now();
+      if (now - lastSentBuffers >= std::chrono::seconds(30)) {
+        lastSentBuffers = now;
+        std::vector<torch::Tensor> sendBuffers;
+        for (auto& v : modelBuffers) {
+          sendBuffers.push_back(v.to(torch::kCPU, true, true));
+        }
+        for (auto& n : members_) {
+          if (n != myName) {
+            call<bool>(n, "buffersUpdate", groupName_, sendBuffers);
+          }
+        }
       }
     }
-
-    requestedModelUpdate.clear();
   }
 
   void syncUpdate() {
@@ -1466,6 +1548,9 @@ struct TestJob {
         isWaitingForModelTimestamp = std::chrono::steady_clock::now();
         call<void>(syncMaster, "getModel", myName);
       }
+    }
+    if (haveNewBuffers) {
+      commitBuffersUpdate();
     }
 
     if (!members_.empty()) {
@@ -1780,12 +1865,12 @@ struct TestJob {
 
         while (lbuf.busy);
 
-        std::optional<c10::cuda::CUDAStreamGuard> streamGuard;
         if (isCuda) {
           if (!lbuf.cudaStream) {
             lbuf.cudaStream = c10::cuda::getStreamFromPool(false, device.index());
           }
-          streamGuard.emplace(*lbuf.cudaStream);
+          c10::cuda::set_device(device.index());
+          c10::cuda::setCurrentCUDAStream(*lbuf.cudaStream);
         }
 
         size_t size = buffer.size;
@@ -1829,11 +1914,11 @@ struct TestJob {
 
           return;
         }
-        if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
-          for (auto& v : local) {
-            while (v.busy);
-          }
-        }
+//        if (lbuf.currentSequenceIndex == (size_t)unrollLength) {
+//          for (auto& v : local) {
+//            while (v.busy);
+//          }
+//        }
         auto start = std::chrono::steady_clock::now();
         lbuf.busy = true;
         for (size_t i = 0; i < size; i += stride, ++clientIndex) {
@@ -1885,8 +1970,8 @@ struct TestJob {
             auto opts = torch::TensorOptions(value.dtype()).device(device);
             std::vector<int64_t> sizes = value.sizes().vec();
             sizes.at(0) = actorBatchSize;
-            sizes.insert(sizes.begin(), (int64_t)unrollLength);
-            lbuf.inputDeviceSeq.push_back(torch::empty(sizes,  opts));
+            sizes.insert(sizes.begin(), (int64_t)unrollLength + 1);
+            lbuf.inputDeviceSeq.push_back(torch::empty(sizes, opts));
           }
         }
 //        auto& input = inputTmp;
@@ -1904,10 +1989,9 @@ struct TestJob {
         //asyncforward.run([&, size, stride, bufferIndex]() {
         {
           Profile p("aforward");
-          std::optional<c10::cuda::CUDAStreamGuard> streamGuard;
-          if (isCuda) {
-            streamGuard.emplace(*lbuf.cudaStream);
-          }
+
+          c10::cuda::set_device(device.index());
+          c10::cuda::setCurrentCUDAStream(*lbuf.cudaStream);
 
           //std::lock_guard lm(modelMutex);
 
@@ -1958,6 +2042,10 @@ struct TestJob {
 
           if (gradMode == false && lbuf.currentSequenceIndex == 0) {
             lbuf.initialModelState = ms;
+          }
+
+          if (gradMode == false && lbuf.currentSequenceIndex == (size_t)unrollLength) {
+            lbuf.nextInitialModelState = ms;
           }
 
           pprepare.stop();
@@ -2014,7 +2102,7 @@ struct TestJob {
               if (sizes.size() < 2) {
                 throw std::runtime_error("Model output has not enough dimensions");
               }
-              sizes.at(0) = unrollLength;
+              sizes.at(0) = unrollLength + 1;
               sizes.at(1) = actorBatchSize;
               auto opts = torch::TensorOptions(value.dtype()).device(device);
               lbuf.outputDeviceSeq.push_back(torch::empty(sizes, opts));
@@ -2058,15 +2146,21 @@ struct TestJob {
             }
           });
           if (false) {
-            if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
+            if (lbuf.currentSequenceIndex == (size_t)unrollLength) {
               lbuf.currentSequenceIndex = 0;
             } else {
               ++lbuf.currentSequenceIndex;
             }
           } else {
+            setTrainStream();
             syncUpdate();
-            if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
+            if (lbuf.currentSequenceIndex == (size_t)unrollLength) {
               lbuf.currentSequenceIndex = 0;
+
+              if (isCuda) {
+                Profile p("synchronize");
+                lbuf.cudaStream->synchronize();
+              }
 
               if (gradMode == false) {
 
@@ -2083,6 +2177,20 @@ struct TestJob {
                 for (size_t i = 0; i != qd.outputDeviceSeq.size(); ++i) {
                   lbuf.outputDeviceSeq[i] = torch::empty_like(qd.outputDeviceSeq[i]);
                 }
+
+                for (size_t i = 0; i != lbuf.inputDeviceSeq.size(); ++i) {
+                  auto dst = lbuf.inputDeviceSeq[i].select(0, 0).narrow(0, 0, size);
+                  auto src = qd.inputDeviceSeq[i].select(0, lbuf.currentSequenceIndex).narrow(0, 0, size);
+                  dst.copy_(src, true);
+                }
+                for (size_t i = 0; i != lbuf.outputDeviceSeq.size(); ++i) {
+                  auto dst = lbuf.outputDeviceSeq[i].select(0, 0).narrow(0, 0, size);
+                  auto src = qd.outputDeviceSeq[i].select(0, lbuf.currentSequenceIndex).narrow(0, 0, size);
+                  dst.copy_(src, true);
+                }
+
+                lbuf.initialModelState = lbuf.nextInitialModelState;
+                lbuf.currentSequenceIndex = 1;
 
                 trainQueue.push_back(std::move(qd));
 
@@ -2229,11 +2337,11 @@ struct TestJob {
         //});
         }
         if (gradMode == true) {
-          if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
+          if (lbuf.currentSequenceIndex == (size_t)unrollLength) {
             while (lbuf.busy);
           }
         }
-        if (lbuf.currentSequenceIndex == (size_t)unrollLength - 1) {
+        if (lbuf.currentSequenceIndex == (size_t)unrollLength) {
           float tt = mainTimer.elapsed();
           auto ts = [&](float v) {
             return fmt::sprintf("%g (%g%%)", v, v * 100 / tt);

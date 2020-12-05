@@ -7,14 +7,16 @@
 #include <semaphore.h>
 #endif
 
+#include <x86intrin.h>
+
 namespace rpc {
 
-#if 1
+#if 0
 using SpinMutex = std::mutex;
-#elif __GNUC__ && __x86_64__
+#elif __GNUC__ && __x86_64__ && 0
 
 class SpinMutex {
-  int lock_ = 0;
+  long lock_ = 0;
 public:
   void lock() {
     long tmp, tmp2;
@@ -40,12 +42,14 @@ public:
 };
 
 #else
-class alignas(64) SpinMutex {
+class SpinMutex {
   std::atomic<bool> locked_{false};
 public:
   void lock() {
     do {
-      while (locked_.load(std::memory_order_acquire));
+      while (locked_.load(std::memory_order_acquire)) {
+        _mm_pause();
+      }
     } while (locked_.exchange(true, std::memory_order_acquire));
   }
   void unlock() {
