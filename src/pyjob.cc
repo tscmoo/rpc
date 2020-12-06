@@ -518,7 +518,7 @@ struct Shared {
   };
 
   alignas(64) std::atomic_int clients = 0;
-  std::array<Buffer, 1> buffers;
+  std::array<Buffer, 2> buffers;
 
 
   std::byte* allocateNonAligned(size_t n) {
@@ -1045,7 +1045,7 @@ struct TestJob {
   std::deque<LocalBuffer> local;
 
   size_t trainBatchSize = 256;
-  size_t actorBatchSize = 1;
+  size_t actorBatchSize = 4;
   //size_t optimizerBatchSize = 2;
 
   template<typename T, typename... Args>
@@ -1377,7 +1377,7 @@ struct TestJob {
     }
   };
 
-  std::list<AsyncTrainQueueEntry> asyncTrainQueue;
+  std::deque<AsyncTrainQueueEntry> asyncTrainQueue;
 
   bool isWaitingForGradients = false;
   size_t waitingForGradientsSize = 0;
@@ -1390,8 +1390,11 @@ struct TestJob {
   bool isWaitingForTrainData = false;
   std::chrono::steady_clock::time_point getTrainDataTimestamp;
 
-  std::optional<std::chrono::steady_clock::duration> warmupTime = std::chrono::seconds(120);
+  std::optional<std::chrono::steady_clock::duration> warmupTime = std::chrono::seconds(0);
   std::optional<std::chrono::steady_clock::time_point> warmupStartTimestamp;
+
+  bool shouldGenerateData = false;
+  std::chrono::steady_clock::time_point lastDataGenerationTimestamp;
 
   void asyncTrain(
         std::map<std::string, torch::Tensor> inputMap,
@@ -1593,28 +1596,39 @@ struct TestJob {
       isWaitingForTrainData = false;
     }
 
+    auto tryRequestData = [&]() {
+      if (asyncTrainQueue.empty() && now - getTrainDataTimestamp >= std::chrono::seconds(2)) {
+        if (!members_.empty()) {
+          size_t n = std::uniform_int_distribution<size_t>(0, members_.size() - 1)(threadRng);
+          auto peer = members_[n];
+          if (peer != myName) {
+            log("Train queue is empty, requesting train data from %s\n", peer);
+            isWaitingForTrainData = true;
+            getTrainDataTimestamp = now;
+            getTrainDataFuture = call<std::vector<AsyncTrainQueueEntry>>(peer, "getTrainData", groupName_);
+          }
+        }
+      }
+    };
+
     if (isWaitingForTrainData) {
       if (now - getTrainDataTimestamp >= std::chrono::seconds(10)) {
         log("Timed out waiting for train data\n");
         isWaitingForTrainData = false;
       }
-    } else if (asyncTrainQueue.empty() && now - getTrainDataTimestamp >= std::chrono::seconds(2)) {
-      if (!members_.empty()) {
-        size_t n = std::uniform_int_distribution<size_t>(0, members_.size() - 1)(threadRng);
-        auto peer = members_[n];
-        if (peer != myName) {
-          log("Train queue is empty, requesting train data from %s\n", peer);
-          isWaitingForTrainData = true;
-          getTrainDataTimestamp = now;
-          getTrainDataFuture = call<std::vector<AsyncTrainQueueEntry>>(peer, "getTrainData", groupName_);
-        }
-      }
+    } else {
+      tryRequestData();
     }
 
     if (!isWaitingForGradients && !isWaitingForModel && !asyncTrainQueue.empty()) {
-      auto e = std::move(asyncTrainQueue.back());
+      size_t index = std::uniform_int_distribution<size_t>(0, asyncTrainQueue.size() - 1)(threadRng);
+      auto e = std::move(asyncTrainQueue[index]);
+      std::swap(asyncTrainQueue[index], asyncTrainQueue.back());
       asyncTrainQueue.pop_back();
       log("DEBUG asyncTrainQueue now has %d entries\n", asyncTrainQueue.size());
+      if (asyncTrainQueue.size() <= 2) {
+        tryRequestData();
+      }
       l.unlock();
       trainStep(e.inputMap, e.outputMap, e.initialState);
     }
@@ -2329,9 +2343,38 @@ struct TestJob {
                 }
               }
 
+              shouldGenerateData = false;
+
             } else {
               ++lbuf.currentSequenceIndex;
             }
+
+//            lastDataGenerationTimestamp = std::chrono::steady_clock::now();
+
+//            auto printt = lastDataGenerationTimestamp;
+
+//            while (!shouldGenerateData) {
+//              auto now = std::chrono::steady_clock::now();
+//              if (now - lastDataGenerationTimestamp >= std::chrono::minutes(2)) {
+//                break;
+//              }
+//              if (asyncTrainQueue.empty()) {
+//                log("Train queue is empty, doing let's generate data call\n");
+//                shouldGenerateData = true;
+//                for (auto& n : members_) {
+//                  if (n != myName) {
+//                    call<bool>(n, "letsGenerateData", groupName_);
+//                  }
+//                }
+//                break;
+//              }
+//              if (now - printt >= std::chrono::seconds(2)) {
+//                printt = now;
+//                log("Not generating data\n");
+//              }
+//              std::this_thread::sleep_for(std::chrono::milliseconds(1));
+//              syncUpdate();
+//            }
           }
           lbuf.busy = false;
         //});
