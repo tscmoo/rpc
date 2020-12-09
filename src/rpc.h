@@ -86,7 +86,7 @@ struct Rpc {
     reqAck,
     reqNack,
     reqFunctionNotFound,
-    reqFindFunction,
+    reqFindFunction__deprecated,
     reqPoke,
     //reqNotFound,
     reqLookingForPeer,

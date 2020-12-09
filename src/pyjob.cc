@@ -1022,8 +1022,10 @@ struct TestJob {
   py::object newOptimizerState;
 
   size_t numSyncedGradients = 0;
+  size_t numSkippedGradients = 0;
   std::vector<torch::Tensor> syncedGrads;
   std::vector<std::tuple<uint32_t, uint32_t, std::vector<torch::Tensor>>> queuedSyncGrads;
+  std::vector<std::tuple<uint32_t, uint32_t>> queuedSkipGrads;
 
   std::string myName;
   std::vector<torch::Tensor> modelParameters;
@@ -1045,7 +1047,7 @@ struct TestJob {
   std::deque<LocalBuffer> local;
 
   size_t trainBatchSize = 256;
-  size_t actorBatchSize = 4;
+  size_t actorBatchSize = 1024;
   //size_t optimizerBatchSize = 2;
 
   template<typename T, typename... Args>
@@ -1096,7 +1098,7 @@ struct TestJob {
           log("Got grads for wrong group %s\n", group);
           return false;
         }
-        if (!isWaitingForGradients || numUpdates > numUpdates_) {
+        if (!isWaitingForGradients || numUpdates > numUpdates_ || syncId > syncId_) {
           log("Got early grads; queueing\n");
           queuedSyncGrads.emplace_back(syncId, numUpdates, std::move(grads));
           return true;
@@ -1119,6 +1121,32 @@ struct TestJob {
           return true;
         } else {
           log("Ignoring grads as they are too old (age %d)\n", age);
+          return false;
+        }
+      });
+
+      rpc->define<bool(std::string_view, uint32_t, uint32_t)>("skipGrads", [this](std::string_view group, uint32_t syncId, uint32_t numUpdates) {
+        std::lock_guard l(syncMutex);
+        if (group != groupName_) {
+          log("Got skip grads for wrong group %s\n", group);
+          return false;
+        }
+        if (!isWaitingForGradients || numUpdates > numUpdates_ || syncId > syncId_) {
+          log("Got early skip grads; queueing\n");
+          queuedSkipGrads.emplace_back(syncId, numUpdates);
+          return true;
+        }
+        if (syncId != syncId_) {
+          log("Got skip grads for wrong syncId (%#x, should be %#x)\n", syncId, syncId_);
+          return false;
+        }
+        uint32_t age = numUpdates_ - numUpdates;
+        log("Recv skip grads %#x %#x (age %d)\n", syncId, numUpdates, age);
+        if (age == 0) {
+          ++numSkippedGradients;
+          return true;
+        } else {
+          log("Ignoring skip grads as they are too old (age %d)\n", age);
           return false;
         }
       });
@@ -1187,6 +1215,19 @@ struct TestJob {
           log("Got train data request, but I don't have enough\n");
         }
         return r;
+      });
+
+      rpc->define<bool(std::string_view, std::vector<AsyncTrainQueueEntry>)>("trainData", [this](std::string_view groupName, std::vector<AsyncTrainQueueEntry> data) {
+        if (groupName != groupName_) {
+          log("Got train data for wrong group (%s, my group is %s)\n", groupName, groupName_);
+          return false;
+        }
+        std::lock_guard l(syncMutex);
+        log("Received %d entries of train data!\n", data.size());
+        for (auto& v : data) {
+          asyncTrainQueue.push_back(std::move(v));
+        }
+        return true;
       });
 
       log("My name is %s, connecting to broker at %s\n", myName, brokerAddress);
@@ -1317,7 +1358,7 @@ struct TestJob {
         log("syncedGrads is empty!\n");
         zeroGrad();
       } else {
-        log("Adding in %d gradients\n", numSyncedGradients);
+        log("Adding in %d gradients (%d skipped)\n", numSyncedGradients, numSkippedGradients);
         if (numSyncedGradients) {
           size_t i = 0;
           for (auto& v : modelParameters) {
@@ -1326,7 +1367,7 @@ struct TestJob {
               if (i == syncedGrads.size()) {
                 throw std::runtime_error("grads grew?");
               }
-              grad.copy_(syncedGrads[i]);
+              grad.copy_(syncedGrads[i], true);
               grad.mul_(1.0f / numSyncedGradients);
               syncedGrads[i].zero_();
               ++i;
@@ -1338,6 +1379,7 @@ struct TestJob {
           numSyncedGradients = 0;
         }
       }
+      numSkippedGradients = 0;
       ++numUpdates_;
       log("numUpdates is now %d\n", numUpdates_);
 
@@ -1390,11 +1432,12 @@ struct TestJob {
   bool isWaitingForTrainData = false;
   std::chrono::steady_clock::time_point getTrainDataTimestamp;
 
-  std::optional<std::chrono::steady_clock::duration> warmupTime = std::chrono::seconds(0);
+  std::optional<std::chrono::steady_clock::duration> warmupTime = std::chrono::seconds(30);
   std::optional<std::chrono::steady_clock::time_point> warmupStartTimestamp;
 
   bool shouldGenerateData = false;
   std::chrono::steady_clock::time_point lastDataGenerationTimestamp;
+  std::chrono::steady_clock::time_point lastDistributeData;
 
   void asyncTrain(
         std::map<std::string, torch::Tensor> inputMap,
@@ -1421,16 +1464,24 @@ struct TestJob {
     if (rpc) {
       std::unique_lock l(syncMutex);
       if (isWaitingForGradients || isWaitingForModel) {
-        log("Waiting for gradients, push to queue\n");
+        if (isWaitingForGradients) {
+          log("Waiting for gradients, push to queue\n");
+        } else if (isWaitingForModel) {
+          log("Waiting for model, push to queue\n");
+        }
         asyncTrainQueue.push_back(e);
         if (asyncTrainQueue.size() == std::max(8192 / trainBatchSize, (size_t)8)) {
           log("WARNING: async train queue is full, discarding data!\n");
           asyncTrainQueue.pop_front();
         }
       } else {
-        l.unlock();
-        log("Not waiting for gradients, do trainStep!\n");
-        trainStep(e.inputMap, e.outputMap, e.initialState);
+        if (shouldGenerateData) {
+          asyncTrainQueue.push_back(e);
+        } else {
+          l.unlock();
+          log("Not waiting for gradients, do trainStep!\n");
+          trainStep(e.inputMap, e.outputMap, e.initialState);
+        }
       }
     }
 
@@ -1559,12 +1610,12 @@ struct TestJob {
     if (!members_.empty()) {
       sendModelUpdates();
       if (isWaitingForGradients && !isWaitingForModel) {
-        if (numSyncedGradients >= waitingForGradientsSize) {
+        if (numSyncedGradients + numSkippedGradients >= waitingForGradientsSize) {
+          isWaitingForGradients = false;
           log("Got all gradients in %gs, running optimizer\n", seconds(std::chrono::steady_clock::now() - waitingForGradientsTimestamp));
           l.unlock();
           optimizerStep();
           l.lock();
-          isWaitingForGradients = false;
         } else {
           auto now = std::chrono::steady_clock::now();
           if (now - waitingForGradientsTimestamp >= std::chrono::seconds(30)) {
@@ -1597,12 +1648,12 @@ struct TestJob {
     }
 
     auto tryRequestData = [&]() {
-      if (asyncTrainQueue.empty() && now - getTrainDataTimestamp >= std::chrono::seconds(2)) {
+      if (now - getTrainDataTimestamp >= std::chrono::seconds(2)) {
         if (!members_.empty()) {
           size_t n = std::uniform_int_distribution<size_t>(0, members_.size() - 1)(threadRng);
           auto peer = members_[n];
           if (peer != myName) {
-            log("Train queue is empty, requesting train data from %s\n", peer);
+            log("Train queue is %s, requesting train data from %s\n", asyncTrainQueue.empty() ? "empty" : "nearly empty", peer);
             isWaitingForTrainData = true;
             getTrainDataTimestamp = now;
             getTrainDataFuture = call<std::vector<AsyncTrainQueueEntry>>(peer, "getTrainData", groupName_);
@@ -1617,20 +1668,130 @@ struct TestJob {
         isWaitingForTrainData = false;
       }
     } else {
-      tryRequestData();
-    }
-
-    if (!isWaitingForGradients && !isWaitingForModel && !asyncTrainQueue.empty()) {
-      size_t index = std::uniform_int_distribution<size_t>(0, asyncTrainQueue.size() - 1)(threadRng);
-      auto e = std::move(asyncTrainQueue[index]);
-      std::swap(asyncTrainQueue[index], asyncTrainQueue.back());
-      asyncTrainQueue.pop_back();
-      log("DEBUG asyncTrainQueue now has %d entries\n", asyncTrainQueue.size());
-      if (asyncTrainQueue.size() <= 2) {
+      if (asyncTrainQueue.empty() && !shouldGenerateData) {
         tryRequestData();
       }
-      l.unlock();
-      trainStep(e.inputMap, e.outputMap, e.initialState);
+    }
+
+    if (!isWaitingForGradients && !isWaitingForModel) {
+      if (shouldGenerateData) {
+        dataGenTrainStep();
+      } else if (!asyncTrainQueue.empty()) {
+        size_t index = std::uniform_int_distribution<size_t>(0, asyncTrainQueue.size() - 1)(threadRng);
+        auto e = std::move(asyncTrainQueue[index]);
+        std::swap(asyncTrainQueue[index], asyncTrainQueue.back());
+        asyncTrainQueue.pop_back();
+        log("DEBUG asyncTrainQueue now has %d entries\n", asyncTrainQueue.size());
+        if (asyncTrainQueue.size() <= 2) {
+          tryRequestData();
+        }
+        l.unlock();
+        trainStep(e.inputMap, e.outputMap, e.initialState);
+      }
+    }
+  }
+
+  void distributeTrainData() {
+    if (asyncTrainQueue.size() >= 4 && members_.size() > 1) {
+      log("I have generated some data (%d), distributing it\n", asyncTrainQueue.size());
+      auto list = members_;
+      std::shuffle(list.begin(), list.end(), threadRng);
+      std::shuffle(asyncTrainQueue.begin(), asyncTrainQueue.end(), threadRng);
+      size_t stride = (asyncTrainQueue.size() + list.size()) / (list.size() - 1);
+      std::vector<AsyncTrainQueueEntry> batch;
+      while (asyncTrainQueue.size() > 2 && !list.empty()) {
+        auto dst = list.back();
+        list.pop_back();
+        if (dst != myName) {
+          batch.clear();
+          for (size_t i = 0; i != stride && asyncTrainQueue.size() > 2; ++i) {
+            batch.push_back(std::move(asyncTrainQueue.back()));
+            asyncTrainQueue.pop_back();
+          }
+          call<bool>(dst, "trainData", groupName_, batch);
+        }
+      }
+      log("After distributing, asyncTrainQueue size is %d\n", asyncTrainQueue.size());
+    }
+  }
+
+  void dataGenTrainStep() {
+    isWaitingForGradients = true;
+    waitingForGradientsSize = members_.size();
+    waitingForGradientsTimestamp = std::chrono::steady_clock::now();
+    if (numSyncedGradients) {
+      numSyncedGradients = 0;
+      for (auto& v : syncedGrads) {
+        v.zero_();
+      }
+    }
+    numSkippedGradients = 1;
+
+    unqueueGrads();
+
+    log("Doing data gen, sending skip grads\n");
+
+    for (auto& n : members_) {
+      if (n != myName) {
+        rpc->asyncCallback<bool>(n, "skipGrads", [this, syncid = syncId_](bool* value, rpc::Error* err) mutable {
+          if (value) {
+            log("skip grads returned %d!\n", *value);
+            std::unique_lock l(syncMutex);
+            if (!*value && syncid == syncId_ && !isResyncing) {
+//              log("skip grads failed, requesting resync\n");
+//              call<void>("broker", "resync", groupName_);
+//              if (syncMaster != myName) {
+//                isWaitingForModel = true;
+//                isWaitingForModelTimestamp = std::chrono::steady_clock::now();
+//                call<void>(syncMaster, "getModel", myName);
+//              }
+            }
+          } else {
+            log("RPC error: %s\n", err->what());
+          }
+        }, groupName_, syncId_, numUpdates_);
+      }
+    }
+
+    distributeTrainData();
+  }
+
+  void unqueueGrads() {
+    bool resync = false;
+    for (auto& [sid, numupdates, grads] : queuedSyncGrads) {
+      if (sid != syncId_ || numupdates != numUpdates_) {
+        log("Got queued grads for {%d, %d}, expected {%d, %d}\n", sid, numupdates, syncId_, numUpdates_);
+        //log("Got queued grads for {%d, %d}, expected {%d, %d}. Requesting resync\n", sid, numupdates, syncId_, numUpdates_);
+        //resync = true;
+      } else if (grads.size() != syncedGrads.size()) {
+        log("Got queued grads for wrong number of grads\n");
+        //log("Got queued grads for wrong number of grads. Requesting resync\n");
+        //resync = true;
+      } else {
+        ++numSyncedGradients;
+        size_t i = 0;
+        for (auto& v : grads) {
+          syncedGrads[i].add_(v);
+          ++i;
+        }
+      }
+    }
+    queuedSyncGrads.clear();
+    for (auto& [sid, numupdates] : queuedSkipGrads) {
+      if (sid != syncId_ || numupdates != numUpdates_) {
+        log("Got queued skip grads for {%d, %d}, expected {%d, %d}\n", sid, numupdates, syncId_, numUpdates_);
+      } else {
+        ++numSkippedGradients;
+      }
+    }
+    queuedSkipGrads.clear();
+    if (resync) {
+      call<void>("broker", "resync", groupName_);
+      if (syncMaster != myName) {
+        isWaitingForModel = true;
+        isWaitingForModelTimestamp = std::chrono::steady_clock::now();
+        call<void>(syncMaster, "getModel", myName);
+      }
     }
   }
 
@@ -1721,6 +1882,7 @@ struct TestJob {
               v.zero_();
             }
           }
+          numSkippedGradients = 0;
           for (auto& v : modelParameters) {
             auto& grad = v.grad();
             if (grad.defined()) {
@@ -1735,13 +1897,13 @@ struct TestJob {
                   log("grads returned %d!\n", *value);
                   std::unique_lock l(syncMutex);
                   if (!*value && syncid == syncId_ && !isResyncing) {
-                    log("grads failed, requesting resync\n");
-                    call<void>("broker", "resync", groupName_);
-                    if (syncMaster != myName) {
-                      isWaitingForModel = true;
-                      isWaitingForModelTimestamp = std::chrono::steady_clock::now();
-                      call<void>(syncMaster, "getModel", myName);
-                    }
+//                    log("grads failed, requesting resync\n");
+//                    call<void>("broker", "resync", groupName_);
+//                    if (syncMaster != myName) {
+//                      isWaitingForModel = true;
+//                      isWaitingForModelTimestamp = std::chrono::steady_clock::now();
+//                      call<void>(syncMaster, "getModel", myName);
+//                    }
                   }
                 } else {
                   log("RPC error: %s\n", err->what());
@@ -1758,35 +1920,7 @@ struct TestJob {
               ++i;
             }
           }
-          bool resync = false;
-          for (auto& v : queuedSyncGrads) {
-            auto& [sid, numupdates, grads] = v;
-            if (sid != syncId_ || numupdates != numUpdates_) {
-              log("Got queued update for {%d, %d}, expected {%d, %d}\n", sid, numupdates, syncId_, numUpdates_);
-              //log("Got queued update for {%d, %d}, expected {%d, %d}. Requesting resync\n", sid, numupdates, syncId_, numUpdates_);
-              //resync = true;
-            } else if (grads.size() != syncedGrads.size()) {
-              log("Got queued grads for wrong number of grads\n");
-              //log("Got queued grads for wrong number of grads. Requesting resync\n");
-              //resync = true;
-            } else {
-              ++numSyncedGradients;
-              size_t i = 0;
-              for (auto& v : grads) {
-                syncedGrads[i].add_(v);
-                ++i;
-              }
-            }
-          }
-          queuedSyncGrads.clear();
-          if (resync) {
-            call<void>("broker", "resync", groupName_);
-            if (syncMaster != myName) {
-              isWaitingForModel = true;
-              isWaitingForModelTimestamp = std::chrono::steady_clock::now();
-              call<void>(syncMaster, "getModel", myName);
-            }
-          }
+          unqueueGrads();
         } else {
           log("I am not a member, not participating in sync!\n");
         }
@@ -2309,6 +2443,10 @@ struct TestJob {
                   asyncTrain(input, outputMap, initialState);
                 }
 
+                if (shouldGenerateData) {
+                  distributeTrainData();
+                }
+
               } else {
                 printf("unreachable\n");
 
@@ -2349,23 +2487,28 @@ struct TestJob {
               ++lbuf.currentSequenceIndex;
             }
 
-//            lastDataGenerationTimestamp = std::chrono::steady_clock::now();
+            lastDataGenerationTimestamp = std::chrono::steady_clock::now();
 
+            shouldGenerateData = asyncTrainQueue.empty() && !syncedGrads.empty();
 //            auto printt = lastDataGenerationTimestamp;
 
-//            while (!shouldGenerateData) {
+//            while (!shouldGenerateData && !terminate_) {
 //              auto now = std::chrono::steady_clock::now();
 //              if (now - lastDataGenerationTimestamp >= std::chrono::minutes(2)) {
+//                log("It's been a while, generating some data!\n");
+//                shouldGenerateData = true;
 //                break;
 //              }
 //              if (asyncTrainQueue.empty()) {
-//                log("Train queue is empty, doing let's generate data call\n");
-//                shouldGenerateData = true;
-//                for (auto& n : members_) {
-//                  if (n != myName) {
-//                    call<bool>(n, "letsGenerateData", groupName_);
-//                  }
+//                if (!syncedGrads.empty()) {
+//                  log("Train queue is empty, generating some data\n");
+//                  shouldGenerateData = true;
 //                }
+////                for (auto& n : members_) {
+////                  if (n != myName) {
+////                    call<bool>(n, "letsGenerateData", groupName_);
+////                  }
+////                }
 //                break;
 //              }
 //              if (now - printt >= std::chrono::seconds(2)) {

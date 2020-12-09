@@ -928,8 +928,9 @@ struct PeerImpl {
     } else {
       size_t i = threadRandom<size_t>(0, x.conns.size() - 1);
       auto& c = x.conns[i];
-      if (c->dead.load(std::memory_order_relaxed) || now - c->lastReceivedData >= std::chrono::seconds(15)) {
-        //log("Connection through %s to %s is dead, yo!\n", connectionTypeName[index<API>], name);
+      //if (c->dead.load(std::memory_order_relaxed) || now - c->lastReceivedData >= std::chrono::seconds(15)) {
+      if (c->dead.load(std::memory_order_relaxed)) {
+        log("Connection through %s to %s is dead, yo!\n", connectionTypeName[index<API>], name);
         BufferHandle buffer;
         serializeToBuffer(buffer, (uint32_t)0, (uint32_t)Rpc::reqClose);
         ((RpcConnectionImpl<API>&)*c).send(std::move(buffer));
@@ -950,6 +951,7 @@ struct PeerImpl {
 
   void throwAway(Connection& x, size_t i) {
     auto cv = std::move(x.conns[i]);
+    log("Throwing away connection %s to %s\n", connectionTypeName.at(cv->apiIndex()), name);
     std::swap(x.conns.back(), x.conns[i]);
     x.conns.pop_back();
     if (x.conns.empty()) {
@@ -1471,12 +1473,49 @@ struct Rpc::Impl {
     });
   }
 
+  template <typename F>
+  struct FBuiltin : FBase {
+    F f;
+    template<typename F2>
+    FBuiltin(F2&& f) : f(std::forward<F2>(f)) {
+    }
+    virtual ~FBuiltin() {}
+    virtual void call(BufferHandle inbuffer, Function<void(BufferHandle)> callback) noexcept override {
+      f(std::move(inbuffer), std::move(callback));
+    }
+  };
+
+  template<typename F>
+  void definebuiltin(std::string_view name, F&& f) {
+    define(name, std::make_unique<FBuiltin<F>>(std::move(f)));
+  }
+
   Impl() {
     log("%p peer id is %s\n", (void*)this, myId.toString().c_str());
     incomingFifo_.next = &incomingFifo_;
     incomingFifo_.prev = &incomingFifo_;
     outgoingFifo_.next = &outgoingFifo_;
     outgoingFifo_.prev = &outgoingFifo_;
+
+
+    definebuiltin("__reqFindFunction", [this](BufferHandle inbuffer, Function<void(BufferHandle)> callback) {
+      // Look up function id by name
+      std::string_view name;
+      deserializeBuffer(inbuffer, name);
+      //log("find function '%s'\n", name);
+      RemoteFunction rf;
+      {
+        std::lock_guard l(mutex_);
+        auto i = funcIds_.find(name);
+        if (i != funcIds_.end()) {
+          rf.id = i->second;
+        }
+      }
+      //log("returning fid %#x\n", rf.id);
+      BufferHandle buffer;
+      serializeToBuffer(buffer, (uint32_t)0, (uint32_t)Rpc::reqSuccess, (uint32_t)0, rf);
+      callback(std::move(buffer));
+    });
   }
   virtual ~Impl() {
     terminate_ = true;
@@ -1526,11 +1565,15 @@ struct Rpc::Impl {
 
   template<typename T>
   std::chrono::steady_clock::time_point processTimeout(T& o, std::chrono::steady_clock::time_point now, Resend& s, uint32_t partIndex) {
+    //log("Process timeout for rid %#x part %d to %s\n", o.rid, partIndex, o.peer->name);
     auto newTimeout = now + std::chrono::seconds(1);
-    if (partIndex && s.acked) {
+    if (partIndex && s.acked && s.connection) {
       return newTimeout;
     }
     if (s.connection) {
+      if (now - s.lastSendTimestamp <= std::chrono::milliseconds(250)) {
+        return now + std::chrono::milliseconds(250);
+      }
       if (!s.hasAddedFailureLatency && now - s.lastSendTimestamp >= std::chrono::milliseconds(1000)) {
         s.hasAddedFailureLatency = true;
         log("  -- rid %#x to %s   %s failed \n", o.rid, o.peer->name, connectionTypeName.at(s.connectionIndex));
@@ -1808,6 +1851,10 @@ struct Rpc::Impl {
     });
   }
 
+  uint32_t getFunctionId(std::string_view name) {
+    return baseFuncId_ + std::hash<std::string_view>()(name) % maxFunctions_;
+  }
+
   void define(std::string_view name, std::unique_ptr<Rpc::FBase>&& f) {
     name = persistentString(name);
     std::lock_guard l(mutex_);
@@ -1815,7 +1862,8 @@ struct Rpc::Impl {
       throw Error("Too many RPC functions defined");
     }
     //uint32_t id = baseFuncId_ + nextFuncIndex_++;
-    uint32_t id = baseFuncId_ + std::hash<std::string_view>()(name) % maxFunctions_;
+    uint32_t id = getFunctionId(name);
+    //log("Define function %s with id %#x\n", name, id);
     size_t index = id - baseFuncId_;
     if (funcs_.size() <= index) {
       funcs_.resize(std::max(index + 1, funcs_.size() + funcs_.size() / 2));
@@ -1981,12 +2029,22 @@ struct Rpc::Impl {
   bool resend(PeerImpl& peer, Resend& s) {
     size_t index;
     Me<RpcConnectionImplBase> connection;
+    uint32_t rid, fid, partIndex = -2;
+    auto buf = deserializeBufferPart(s.buffer->data(), s.buffer->size, rid, fid);
+    if (fid >= Rpc::reqCallOffset) {
+      buf = deserializeBufferPart(buf.data(), buf.size(), partIndex);
+      if (partIndex == ~0) {
+        deserializeBufferPart(buf.data(), buf.size(), partIndex);
+      }
+    }
     if (peer.banditSend(~0, s.buffer, &index, &connection)) {
+      //log("resend %#x %#x part %d success\n", rid, fid, partIndex);
       s.lastSendTimestamp = std::chrono::steady_clock::now();
       s.connection = std::move(connection);
       s.connectionIndex = index;
       return true;
     } else {
+      //log("resend %#x %#x part %d failure\n", rid, fid, partIndex);
       s.lastSendFailTimestamp = std::chrono::steady_clock::now();
       s.connection = nullptr;
       return false;
@@ -2104,13 +2162,16 @@ struct Rpc::Impl {
 
   void sendRequest(std::string_view peerName, std::string_view functionName, BufferHandle buffer, ResponseCallback response) noexcept {
     //log("sendRequest %s::%s %d bytes\n", peerName, functionName, buffer->size);
+    if (peerName == myName) {
+      throw std::runtime_error("Attempt to call function " + std::string(functionName) + " on myself! Self-calling is not supported");
+    }
     auto& peer = getPeer(peerName);
     uint32_t fid = peer.functionId(functionName);
     if (fid == 0) {
       functionName = persistentString(functionName);
       BufferHandle buffer2;
-      serializeToBuffer(buffer2, (uint32_t)0, (uint32_t)0, functionName);
-      sendRequest(peer, reqFindFunction, std::move(buffer2), [this, peer = &peer, functionName = functionName, buffer = std::move(buffer), response = std::move(response)](BufferHandle recvbuffer, Error* error) mutable noexcept {
+      serializeToBuffer(buffer2, (uint32_t)0, (uint32_t)0, (uint32_t)0, functionName);
+      sendRequest(peer, getFunctionId("__reqFindFunction"), std::move(buffer2), [this, peer = &peer, functionName = functionName, buffer = std::move(buffer), response = std::move(response)](BufferHandle recvbuffer, Error* error) mutable noexcept {
         if (error) {
           std::move(response)(nullptr, error);
         } else {
@@ -2529,7 +2590,8 @@ struct RpcImpl : RpcImplBase {
       if (x.peer != &peer) {
         log("peer %p vs %p\n", (void*)x.peer, (void*)&peer);
         log("rid collision on poke! (not fatal!)\n");
-        std::terminate();
+        return;
+        //std::terminate();
       }
       bool ack = false;
       if (x.recv.done) {
@@ -2545,7 +2607,7 @@ struct RpcImpl : RpcImplBase {
         }
         l.unlock();
       }
-      //log("got poke %s %d\n", ack ? "ack" : "nack", partIndex);
+      //log("got poke %s rid %#x %d\n", ack ? "ack" : "nack", rid, partIndex);
       BufferHandle buffer;
       serializeToBuffer(buffer, rid, ack ? Rpc::reqAck : Rpc::reqNack, partIndex);
       conn.send(std::move(buffer));
@@ -2718,7 +2780,7 @@ struct RpcImpl : RpcImplBase {
         }
         auto& s = partIndex == 0 ? x.resend : x.resendTensors[partIndex - 1];
         if (!s.acked) {
-          //log("handleAck got ack for part %d\n", partIndex);
+          //log("handleAck got ack for rid %#x part %d\n", rid, partIndex);
           s.nackCount = 0;
           s.acked = true;
           s.ackTimestamp = now;
@@ -2752,7 +2814,7 @@ struct RpcImpl : RpcImplBase {
   void handleNack(T& container, PeerImpl& peer, RpcConnectionImpl<API>& conn, uint32_t rid, const std::byte* ptr, size_t len) {
     uint32_t partIndex = 0;
     deserializeBuffer(ptr, len, partIndex);
-    //log("got nack %d\n", partIndex);
+    //log("got nack rid %#x part %d\n", rid, partIndex);
     auto& bucket = rpc.getBucket(container, rid);
     std::unique_lock l(bucket.mutex);
     auto i = bucket.map.find(rid);
@@ -2771,10 +2833,10 @@ struct RpcImpl : RpcImplBase {
         ++s.nackCount;
         //log("nackCount is now %d\n", s.nackCount);
         if (!s.connection) {
-          //log("nack resend\n");
+          //log("nack %#x %d resend\n", rid, partIndex);
           rpc.resend(peer, s);
         } else {
-          //log("nack but resend already in progress\n");
+          //log("nack %#x %d but resend already in progress\n", rid, partIndex);
         }
       }
     }
@@ -2784,25 +2846,25 @@ struct RpcImpl : RpcImplBase {
     //log("onRequest rid %#x fid %#x  from %s\n", rid, fid, peer.name);
     rid &= ~(uint32_t)1;
     switch (fid) {
-    case Rpc::reqFindFunction: {
-      // Look up function id by name
-      std::string_view name;
-      deserializeBuffer(ptr, len, name);
-      //log("find function '%s'\n", name);
-      RemoteFunction rf;
-      {
-        std::lock_guard l(rpc.mutex_);
-        auto i = rpc.funcIds_.find(name);
-        if (i != rpc.funcIds_.end()) {
-          rf.id = i->second;
-        }
-      }
-      //log("returning fid %#x\n", rf.id);
-      BufferHandle buffer;
-      serializeToBuffer(buffer, rid, Rpc::reqSuccess, (uint32_t)0, rf);
-      conn.send(std::move(buffer));
-      break;
-    }
+//    case Rpc::reqFindFunction: {
+//      // Look up function id by name
+//      std::string_view name;
+//      deserializeBuffer(ptr, len, name);
+//      //log("find function '%s'\n", name);
+//      RemoteFunction rf;
+//      {
+//        std::lock_guard l(rpc.mutex_);
+//        auto i = rpc.funcIds_.find(name);
+//        if (i != rpc.funcIds_.end()) {
+//          rf.id = i->second;
+//        }
+//      }
+//      //log("returning fid %#x\n", rf.id);
+//      BufferHandle buffer;
+//      serializeToBuffer(buffer, rid, Rpc::reqSuccess, (uint32_t)0, rf);
+//      conn.send(std::move(buffer));
+//      break;
+//    }
     case Rpc::reqAck: {
       // Peer acknowledged that it has received the response
       // (return value of an RPC call)
@@ -2984,7 +3046,7 @@ struct RpcImpl : RpcImplBase {
     rid |= 1;
     switch (fid) {
     case Rpc::reqClose: {
-      //log("got reqClose\n");
+      //log("got reqClose from %s\n", peer.name);
       auto& x = peer.connections_.at(index<API>);
       std::lock_guard l(x.mutex);
       for (size_t i = 0; i != x.conns.size(); ++i) {
